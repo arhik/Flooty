@@ -1959,7 +1959,7 @@ function runAgentLoop!(sess::ReplSession, task::AbstractString;
                   OllamaMessage(role = "assistant", content = stripThinking(reply),
                                 thinking = isempty(thinking) ? nothing : String(thinking)))
             action = extractActionJson(stripThinking(reply))
-            if action === nothing
+            if action === nothing || !haskey(action, "action")
                 # The model answered in a provider's own tool-call syntax instead of
                 # our JSON. Translate it (and say so) rather than stopping as
                 # "unparseable" with an untouched terminal.

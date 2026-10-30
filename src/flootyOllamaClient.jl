@@ -392,7 +392,9 @@ block early.
 function withReasoning(content::AbstractString, reasoning::AbstractString)
     isempty(strip(reasoning)) && return String(content)
     occursin("<thinking>", content) && return String(content)
+    occursin("<cot>", content) && return String(content)
     safe = replace(String(reasoning), "</thinking>" => "")
+    safe = replace(safe, "</cot>" => "")
     return "<thinking>" * safe * "</thinking>\n" * String(content)
 end
 |
@@ -546,13 +548,21 @@ lfm2.5-thinking emit them before the answer). An unbalanced trailing
 `<thinking>...` (still open at end) is dropped as well.
 """
 function stripThinking(text::AbstractString)
-    s = String(text)
+    s = stripInvisible(String(text))
     s = replace(s, r"<thinking>.*?</thinking>"s => "")
     s = replace(s, r"<thinking>.*$"s => "")
+    s = replace(s, r"<cot>.*?</cot>"s => "")
+    s = replace(s, r"<cot>.*$"s => "")
     s = replace(s, r"<think>.*?</think>"s => "")
     s = replace(s, r"<think>.*$"s => "")
     s = replace(s, r"<\|thought_begin\|>.*?<\|thought_end\|>"s => "")
     s = replace(s, r"<\|thought_begin\|>.*$"s => "")
+    # Orphan close markers (open/close spelling mismatch, e.g. <cot>...</cot><​/think>)
+    s = replace(s, r"</?thinking>" => "")
+    s = replace(s, r"</?cot>" => "")
+    s = replace(s, r"</?think>" => "")
+    s = replace(s, r"<\|thought_end\|>" => "")
+    s = replace(s, r"<\|thought_begin\|>" => "")
     return strip(s)
 end
 |
@@ -565,10 +575,12 @@ discards the block), this captures it for display — so the side panel can
 show what the model reasoned before acting.
 """
 function extractThinking(text::AbstractString)
-    s = String(text)
+    s = stripInvisible(String(text))
     m = match(r"<thinking>(.*?)</thinking>"s, s)
-    m === nothing && (m = match(r"<think>(.*?)</think>"s, s))
+    m === nothing && (m = match(r"<cot>(.*?)</cot>"s, s))
+    m === nothing && (m = match(r"<​think>(.*?)<​/think>"s, s))
     m === nothing && (m = match(r"<\|thought_begin\|>(.*?)<\|thought_end\|>"s, s))
+    m === nothing && (m = match(r"<(?:thinking|cot)>\s*(.*?)\s*</?[^>]*>"s, s))
     return m === nothing ? "" : String(m.captures[1])
 end
 |
