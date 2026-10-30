@@ -832,20 +832,25 @@ makeCompleteFn(cfg::AgentModelConfig, model::AbstractString;
                onThinking = nothing, stream::Bool = true) =
     messages -> begin
         wire = stripProviderPrefix(model) # picker prefix → raw model id for the API
+        # Resolve the provider endpoint for prefixed models (poolside/, ollama:,
+        # chutes:, ssh:, llamacpp:); unknown names keep the caller-supplied default.
+        spec = resolveProviderForModel(String(model))
+        baseUrl = spec === nothing ? String(cfg.baseUrl) : String(spec.baseUrl)
+        apiKey = spec === nothing ? String(cfg.apiKey) : String(spec.apiKey)
+        reasoningField = spec === nothing ? String(cfg.reasoningField) : String(spec.reasoningField)
         # llamacpp models are served by FlootyHub, whose address can change
         # (port fallback, restart). Re-resolve on every call instead of
         # trusting a baseUrl that may have been pinned while the server was
         # down or on a different port.
-        baseUrl = cfg.baseUrl
         if startswith(String(model), "llamacpp:")
-            baseUrl = FlootyStreams.LLAMACPP_BASE_URL[]
+            baseUrl = String(FlootyStreams.LLAMACPP_BASE_URL[])
         end
         if stream
             try
                 return streamCompletion(baseUrl, wire, messages;
-                                        temperature = temperature, apiKey = cfg.apiKey,
+                                        temperature = temperature, apiKey = apiKey,
                                         timeoutS = timeoutS,
-                                        reasoningField = cfg.reasoningField,
+                                        reasoningField = reasoningField,
                                         maxTokens = maxTokens,
                                         jsonMode = jsonMode,
                                         onThinking = onThinking)
@@ -854,9 +859,9 @@ makeCompleteFn(cfg::AgentModelConfig, model::AbstractString;
             end
         end
         return chatCompletion(baseUrl, wire, messages;
-                              temperature = temperature, apiKey = cfg.apiKey,
+                              temperature = temperature, apiKey = apiKey,
                               timeoutS = timeoutS,
-                              reasoningField = cfg.reasoningField,
+                              reasoningField = reasoningField,
                               maxTokens = maxTokens, jsonMode = jsonMode)
     end
 
