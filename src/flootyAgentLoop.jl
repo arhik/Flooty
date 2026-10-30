@@ -377,6 +377,22 @@ function shellParseOK(code::AbstractString)::Bool
     end
 end
 
+function recoverMarkdownCommand(reply::AbstractString)::Union{Nothing,String}
+    text = strip(stripProviderMarkup(stripThinking(reply)))
+    occursin('{', text) && return nothing
+    # Look for a fenced code block: ```sh\ncmd\n``` or ```\ncmd\n```
+    m = match(r"```[a-zA-Z]*\s*\n(.*?)\n```"s, text)
+    m === nothing && return nothing
+    lines = [strip(l) for l in split(m.captures[1], '\n') if !isempty(strip(l))]
+    isempty(lines) && return nothing
+    # Take the first non-empty command line
+    cmd = lines[1]
+    startswith(cmd, "\$") && (cmd = strip(cmd[2:end]))
+    isempty(cmd) && return nothing
+    occursin(r"[.!?]\s*$", cmd) && return nothing
+    return cmd
+end
+
 function recoverBareCommand(reply::AbstractString)::Union{Nothing,String}
     text = strip(stripProviderMarkup(stripThinking(reply)))
     occursin('{', text) && return nothing
@@ -1980,6 +1996,15 @@ function runAgentLoop!(sess::ReplSession, task::AbstractString;
                                  "command as send: " * first(bare, 120))
                     action = JSON.parse(JSON.json(Dict("action" => "send",
                                                          "code" => bare)))
+                end
+            end
+            if action === nothing
+                md = recoverMarkdownCommand(reply)
+                if md !== nothing
+                    loopSay(ctx, "[turn $(ctx.result.turns + 1)] recovered a markdown " *
+                                 "command as send: " * first(md, 120))
+                    action = JSON.parse(JSON.json(Dict("action" => "send",
+                                                         "code" => md)))
                 end
             end
             if action === nothing

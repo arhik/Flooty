@@ -4,9 +4,9 @@
 # (/v1/chat/completions, non-streaming). Models and endpoint are
 # user-configurable via env vars with a remote default:
 #   base URL = https://inference.poolside.ai/v1
-#   actor   model = configurable via FLOOTY_ACTOR_MODEL
-#   monitor model = configurable via FLOOTY_MONITOR_MODEL
-#   api key  = configurable via FLOOTY_API_KEY
+#   actor    model = configurable via FLOOTY_ACTOR_MODEL
+#   monitor  model = configurable via FLOOTY_MONITOR_MODEL
+#   api key       = configurable via FLOOTY_API_KEY (falls back to POOLSIDE_API_KEY)
 #
 # Everything downstream takes an injectable `completeFn(messages)::String`
 # so probes run deterministically WITHOUT a live endpoint; these helpers
@@ -15,36 +15,210 @@
 using HTTP
 using BufferedStreams: BufferedInputStream
 import FlootyStreams
+import FlootyHub
 |
 """
 Config for remote agent models. Construct via `defaultAgentModelConfig()` so
 env overrides (`FLOOTY_INFERENCE_URL`, `FLOOTY_ACTOR_MODEL`,
-`FLOOTY_MONITOR_MODEL`, `FLOOTY_API_KEY`) are honored; fields stay mutable
-for `configureAgent!`.
+`FLOOTY_MONITOR_MODEL`, `FLOOTY_API_KEY` or `POOLSIDE_API_KEY`) are honored;
+fields stay mutable for `configureAgent!`.
 """
 Base.@kwdef mutable struct AgentModelConfig
-    baseUrl::String = "http://127.0.0.1:11434/v1"
-    actorModel::String = "minimax-m3.1-flash:cloud"
-    monitorModel::String = "minimax-m3.1-flash:cloud"
+    baseUrl::String = "https://inference.poolside.ai/v1"
+    actorModel::String = "poolside/laguna-s-2.1"
+    monitorModel::String = "poolside/laguna-s-2.1"
     apiKey::String = ""
     # Which JSON field carries an assistant turn's REASONING on the REQUEST side.
-    # Providers disagree (Poolside/OpenRouter `reasoning`, DeepSeek
-    # `reasoning_content`, Ollama `thinking`); "" disables it. The response side
-    # already reads all three back — see `providerReasoning` — so the request side
-    # is the only half that needs configuring.
-    reasoningField::String = "reasoning"
+    # Providers disagree (DeepSeek/Poolside/OpenRouter `reasoning_content`,
+    # Ollama `thinking`); "" disables it. The response side already reads all
+    # three back — see `providerReasoning` — so the request side is the only
+    # half that needs configuring.
+    reasoningField::String = "reasoning_content"
     # Output budget per completion. Thinking models spend tokens on reasoning
     # BEFORE the JSON action; a small default truncated the action mid-string
     # (ShadowTerm run: five "unparseable" turns in a row, then a 3-strike stop).
-    maxOutputTokens::Int = 4096
+    # Laguna S 2.1's theoretical max output is 131072, but the PoolSide API
+    # currently enforces max_tokens <= 32768 (free developer tier; documented
+    # range is 1–262144). 32768 is the largest value the live endpoint accepts.
+    maxOutputTokens::Int = 32768
+    # P2P: when true, route completions through FlootyCompute peers instead of
+    # talking to a remote endpoint over HTTP.
+    p2p::Bool = false
+    discoveryTopic::String = "flooty"
+    bootstrapPeers::Vector{String} = String[]
+    p2pPort::Int = 0
+    p2pApiPort::Int = 0
 end
-|
-const DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
-const DEFAULT_ACTOR_MODEL = "minimax-m3.1-flash:cloud"
-const DEFAULT_MONITOR_MODEL = "minimax-m3.1-flash:cloud"
+const DEFAULT_BASE_URL = "https://inference.poolside.ai/v1"
+const DEFAULT_ACTOR_MODEL = "poolside/laguna-s-2.1"
+const DEFAULT_MONITOR_MODEL = "poolside/laguna-s-2.1"
 const DEFAULT_API_KEY = ""
-const DEFAULT_REASONING_FIELD = "reasoning"
-|
+const DEFAULT_REASONING_FIELD = "reasoning_content"
+const DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
+# ---- multi-provider model aggregation ---------------------------------------
+# Flooty treats PoolSide as just another named provider (like Chutes) so the
+# picker can list models from ALL known endpoints under <optgroup> labels and
+# route a chosen model to the right baseUrl/apiKey/reasoningField at selection
+# time. SSH Ollama hosts join the same registry when a terminal with
+# `kind=:ssh` is created.
+
+"""
+    ProviderSpec
+
+Static description of a model provider: its display name (for the picker's
+`<optgroup>` label), the API endpoint (`baseUrl`), the key it needs
+(`apiKey`), the prefix that IDENTIFIES models belonging to it in the picker
+(`prefix` — e.g. `"chutes:"`, `"ssh:user@host:"`; empty for PoolSide whose
+model ids already start with `poolside/`), and the JSON field that carries
+reasoning on the REQUEST side (`reasoningField`). `kind` and `remote` drive
+routing: `:poolside/:chutes/:ollama` use HTTP; `:ssh` runs `ollama` over an
+SSH session and the local Ollama native path kicks in when the model was
+listed from a `:11434` endpoint.
+"""
+struct ProviderSpec
+    name::String           # display name for the picker group
+    baseUrl::String        # API endpoint URL (root or /v1)
+    apiKey::String         # bearer token for this provider
+    prefix::String         # picker-side prefix that identifies this provider
+    defaultModel::String   # provider default if any
+    reasoningField::String # request-side reasoning field (e.g. "reasoning_content", "thinking", "")
+    contextLength::Int     # default context window for models from this provider
+    kind::Symbol         # :poolside, :chutes, :ollama, :ssh
+    remote::String         # for SSH: "user@host", empty otherwise
+end
+
+"""
+    ProviderGroup
+
+A display row in the picker: a provider (or peer) name plus the model names it
+offers. The JS builds one `<optgroup>` per group, falling back to flat
+`<option>` rendering when the list is empty.
+ """
+struct ProviderGroup
+    name::String
+    models::Vector{String}
+end
+
+# Dynamic registry: `Symbol -> ProviderSpec` for the static providers
+# (PoolSide, Chutes, local Ollama) and `ssh:remote -> ProviderSpec` for SSH
+# hosts discovered at runtime.
+const KNOWN_PROVIDERS = Dict{Symbol,ProviderSpec}()
+const KNOWN_PROVIDERS_LOCK = ReentrantLock()
+const SSH_OLLAMA_PROVIDERS = Dict{String,ProviderSpec}()
+
+# SSH Ollama remotes registered by the session-terminal hook.
+const SSH_OLLAMA_REMOTES = Set{String}()
+const SSH_REMOTES_LOCK = ReentrantLock()
+
+# TTL caches for multi-provider discovery.
+const PROVIDER_GROUPS_CACHE = Ref{Vector{ProviderGroup}}(ProviderGroup[])
+const PROVIDER_GROUPS_AT = Ref(0.0)
+const PROVIDER_GROUPS_LOCK = ReentrantLock()
+const PROVIDER_GROUPS_TTL = 60.0
+
+# TTL cache for SSH Ollama model lists (so we don't re-ssh on every picker open).
+const SSH_OLLAMA_MODELS_CACHE = Dict{String,Vector{String}}()
+const SSH_OLLAMA_MODELS_AT = Dict{String,Float64}()
+const SSH_OLLAMA_MODELS_LOCK = ReentrantLock()
+
+"""
+    registerSshOllamaRemote!(remote) -> ProviderSpec
+
+Register an SSH target (e.g. "user@host") as an Ollama provider and return
+its `ProviderSpec`. Called from Flooty's session-terminal hook when
+`kind=:ssh`. Idempotent: registering the same remote twice returns the
+existing spec without re-running discovery.
+ """
+function registerSshOllamaRemote!(remote::AbstractString)
+    r = String(remote)
+    isempty(r) && return nothing
+    lock(SSH_REMOTES_LOCK) do
+        push!(SSH_OLLAMA_REMOTES, r)
+        key = "ssh:" * r
+        if !haskey(SSH_OLLAMA_PROVIDERS, key)
+            # The baseUrl points at the user's machine on the standard Ollama
+            # port; port-forwarding (ssh -L) or an SSH proxy must carry traffic.
+            SSH_OLLAMA_PROVIDERS[key] = ProviderSpec(
+                "Ollama (ssh:$(r))", "http://127.0.0.1:11434/v1", "",
+                key * ":", "", "thinking", DEFAULT_CONTEXT_LENGTH, :ssh, r)
+        end
+        return SSH_OLLAMA_PROVIDERS[key]
+    end
+end
+
+"""
+    listSshOllamaModels(remote; refresh=false) -> Vector{String}
+
+Model names from `ssh user@host ollama list`, cached with a TTL. Each name is
+prefixed with `ssh:user@host:` so the picker groups it under the right remote
+and `resolveProviderForModel` can route it.
+ """
+function listSshOllamaModels(remote::AbstractString; refresh::Bool = false)
+    r = String(remote)
+    isempty(r) && return String[]
+    cached = lock(SSH_OLLAMA_MODELS_LOCK) do
+        if !refresh && haskey(SSH_OLLAMA_MODELS_CACHE, r)
+            age = time() - get(SSH_OLLAMA_MODELS_AT, r, 0.0)
+            age < PROVIDER_GROUPS_TTL ? copy(SSH_OLLAMA_MODELS_CACHE[r]) : String[]
+        else
+            String[]
+        end
+    end
+    (!isempty(cached) && !refresh) && return cached
+    # Cold path: shell out to ssh. Runs off the UI thread.
+    out = String[]
+    try
+        cmd = `ssh -o ConnectTimeout=5 -o BatchMode=yes $r ollama list`
+        raw = read(cmd, String)
+        for line in split(raw, '\n')
+            line = strip(line)
+            isempty(line) && continue
+            m = match(r"^([\w:\-./]+)", line)
+            m === nothing && continue
+            name = String(m.captures[1])
+            # ollama list header line looks like "NAME ID SIZE MODIFIED"
+            startswith(lowercase(name), "name") && continue
+            push!(out, "ssh:" * r * ":" * name)
+        end
+    catch err
+        @debug "listSshOllamaModels failed" remote = r exception = err
+    end
+    lock(SSH_OLLAMA_MODELS_LOCK) do
+        SSH_OLLAMA_MODELS_CACHE[r] = out
+        SSH_OLLAMA_MODELS_AT[r] = time()
+    end
+    return out
+end
+
+"""
+    _buildKnownProviders() -> Dict{Symbol,ProviderSpec}
+
+Construct the static provider specs from env vars / constants. PoolSide is
+the default (DEFAULT_BASE_URL, DEFAULT_REASONING_FIELD, the key fallback
+chain). Chutes reads CHUTES_API_TOKEN. Local Ollama defaults to 127.0.0.1:11434.
+ """
+function _buildKnownProviders()
+    d = Dict{Symbol,ProviderSpec}()
+    poolsideKey = something(nonempty(get(ENV, "FLOOTY_API_KEY", "")),
+                             nonempty(get(ENV, "POOLSIDE_API_KEY", "")),
+                             DEFAULT_API_KEY)
+    d[:poolside] = ProviderSpec("PoolSide",
+        DEFAULT_BASE_URL, poolsideKey, "", DEFAULT_ACTOR_MODEL,
+        DEFAULT_REASONING_FIELD, DEFAULT_CONTEXT_LENGTH, :poolside, "")
+    chutesKey = something(nonempty(get(ENV, "FLOOTY_API_KEY", "")),
+                           nonempty(get(ENV, "CHUTES_API_TOKEN", "")), "")
+    d[:chutes] = ProviderSpec("Chutes",
+        "https://llm.chutes.ai/v1", chutesKey, "chutes:", "",
+        "reasoning_content", DEFAULT_CONTEXT_LENGTH, :chutes, "")
+    localUrl = normalizeOllamaUrl(get(ENV, "FLOOTY_OLLAMA_URL", "http://127.0.0.1:11434"))
+    localUrl === nothing && (localUrl = "http://127.0.0.1:11434/v1")
+    d[:ollama] = ProviderSpec("Ollama (local)",
+        localUrl, "", "ollama:", "", "thinking",
+        DEFAULT_CONTEXT_LENGTH, :ollama, "")
+    return d
+end
+
 function defaultAgentModelConfig()
     return AgentModelConfig(
         baseUrl = something(normalizeOllamaUrl(get(ENV, "FLOOTY_INFERENCE_URL", "")),
@@ -53,14 +227,18 @@ function defaultAgentModelConfig()
                                DEFAULT_ACTOR_MODEL),
         monitorModel = something(nonempty(get(ENV, "FLOOTY_MONITOR_MODEL", "")),
                                  DEFAULT_MONITOR_MODEL),
+        # `FLOOTY_API_KEY` is the generic override; `POOLSIDE_API_KEY` is the
+        # provider-specific one — check it second so it acts as a fallback when
+        # the generic var is unset.
         apiKey = something(nonempty(get(ENV, "FLOOTY_API_KEY", "")),
+                           nonempty(get(ENV, "POOLSIDE_API_KEY", "")),
                            DEFAULT_API_KEY),
         # `FLOOTY_REASONING_FIELD` distinguishes "unset" from "explicitly empty":
         # empty means do not send reasoning at all (strict endpoints).
         reasoningField = haskey(ENV, "FLOOTY_REASONING_FIELD") ?
                          String(ENV["FLOOTY_REASONING_FIELD"]) : DEFAULT_REASONING_FIELD,
         maxOutputTokens = something(tryparse(Int, get(ENV, "FLOOTY_MAX_OUTPUT_TOKENS", "")),
-                                   4096),
+                                   DEFAULT_MAX_OUTPUT_TOKENS),
     )
 end
 |
@@ -75,7 +253,7 @@ function normalizeOllamaUrl(s::AbstractString)
     endswith(s, "/v1") || (s *= "/v1")
     return s
 end
-|
+
 """
     requestMessages(messages::Vector{OllamaMessage};
                     reasoningField = DEFAULT_REASONING_FIELD) :: Vector{Dict{String,Any}}
@@ -138,7 +316,36 @@ function chatCompletion(baseUrl::AbstractString, model::AbstractString,
                         temperature::Real = 0.2, apiKey::AbstractString = "",
                         timeoutS::Real = 120.0,
                         reasoningField::AbstractString = DEFAULT_REASONING_FIELD,
-                        maxTokens::Integer = 4096, jsonMode::Bool = false)
+                        maxTokens::Integer = DEFAULT_MAX_OUTPUT_TOKENS, jsonMode::Bool = false)
+    # P2P mode: route through FlootyCompute peers instead of HTTP.
+    if AGENT_CONFIG[].p2p
+        return p2pChatCompletion(model, messages; maxTokens = maxTokens, jsonMode = jsonMode)
+    end
+    # llamacpp models: route through FlootyStreams' Ollama provider (FlootyHub
+    # is Ollama-compatible), so streaming/thinking handling is unified.
+    if startswith(String(model), "llamacpp:")
+        try
+            FlootyHub.registerWithFlooty!()
+            fresh = String(FlootyHub.hub_openai_url())
+            isempty(strip(fresh)) || (baseUrl = fresh)
+        catch err
+            @debug "FlootyHub url refresh failed" exception = (err, catch_backtrace())
+        end
+        isempty(strip(baseUrl)) && error(
+            "no base URL for model '$model' — the provider is not registered or its " *
+            "server is not running (for local GGUF models run `flootyhub serve`)")
+        root = replace(rtrimSlash(baseUrl), r"/v1$" => "")
+        provider = FlootyStreams.OllamaProvider(baseURL = root,
+                                                timeout = Int(round(timeoutS)))
+        wire = stripProviderPrefix(model)
+        opts = Dict{String,Any}("temperature" => Float64(temperature),
+                                 "num_predict" => Int(maxTokens))
+        resp = FlootyStreams.chat(provider, messages, wire, false, nothing, opts)
+        return String(something(resp.message.content, ""))
+    end
+    isempty(strip(baseUrl)) && error(
+        "no base URL for model '$model' — the provider is not registered or its " *
+        "server is not running (for local GGUF models run `flootyhub serve`)")
     url = rtrimSlash(baseUrl) * "/chat/completions"
     bodyDict = Dict{String,Any}(
         "model" => String(model),
@@ -165,8 +372,8 @@ end
     providerReasoning(message) :: String
 
 Reasoning an OpenAI-compatible endpoint returns in a field of its OWN instead of
-inline in the content: `reasoning` (Poolside/Ollama cloud), `reasoning_content`
-(DeepSeek-style), or Ollama's native `thinking`. Empty when the reply carries
+inline in the content: `reasoning_content` (Poolside/DeepSeek/OpenRouter),
+`reasoning` (Ollama cloud), or Ollama's native `thinking`. Empty when the reply carries
 none. Dropping these was why "thinking" never reached the UI on models that
 reason without emitting `<thinking>` tags.
 """
@@ -217,23 +424,31 @@ the UI simply populates a moment later.
 function refreshAgentModels!(cfg::AgentModelConfig = AGENT_CONFIG[])
     @async begin
         list = listAgentModels(cfg)
-        isempty(list) && return nothing
-        lock(MODEL_LIST_LOCK) do
+        isempty(list) || lock(MODEL_LIST_LOCK) do
             MODEL_LIST_CACHE[] = list
             MODEL_LIST_AT[] = time()
         end
-        return nothing
     end
+    @async refreshProviderGroups!()
     return nothing
 end
 
 function availableAgentModels(; refresh::Bool = false)::Vector{String}
-    cached, age = lock(MODEL_LIST_LOCK) do
+    pCached, pAge = lock(MODEL_LIST_LOCK) do
         (copy(MODEL_LIST_CACHE[]), isempty(MODEL_LIST_CACHE[]) ? Inf :
                                   time() - MODEL_LIST_AT[])
     end
-    (refresh || isempty(cached) || age > MODEL_LIST_TTL) && refreshAgentModels!()
-    return cached
+    (refresh || isempty(pCached) || pAge > MODEL_LIST_TTL) && refreshAgentModels!()
+    groups, age = lock(PROVIDER_GROUPS_LOCK) do
+        (copy(PROVIDER_GROUPS_CACHE[]), isempty(PROVIDER_GROUPS_CACHE[]) ? Inf :
+                                  time() - PROVIDER_GROUPS_AT[])
+    end
+    (isempty(groups) || age > PROVIDER_GROUPS_TTL) && refreshProviderGroups!()
+    out = String[]
+    for g in groups
+        append!(out, g.models)
+    end
+    return sort!(unique!(vcat(pCached, out)))
 end
 
 # ---- per-tab models ---------------------------------------------------------
@@ -253,9 +468,18 @@ end
 "Pin the AMBIENT MONITOR of `sess` to `model`; the actor keeps its own model."
 function setSessionMonitorModel!(sess, model::AbstractString)::AgentModelConfig
     base = sessionModelConfig(sess)
-    cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = base.actorModel,
-                           monitorModel = String(model), apiKey = base.apiKey,
-                           reasoningField = base.reasoningField)
+    spec = resolveProviderForModel(model)
+    if spec === nothing
+        cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = base.actorModel,
+                               monitorModel = String(model), apiKey = base.apiKey,
+                               reasoningField = base.reasoningField,
+                               maxOutputTokens = base.maxOutputTokens)
+    else
+        cfg = AgentModelConfig(baseUrl = spec.baseUrl, actorModel = base.actorModel,
+                               monitorModel = String(model), apiKey = spec.apiKey,
+                               reasoningField = spec.reasoningField,
+                               maxOutputTokens = base.maxOutputTokens)
+    end
     lock(MODEL_BY_SESSION_LOCK) do
         MODEL_BY_SESSION[sess] = cfg
     end
@@ -265,9 +489,18 @@ end
 "Pin `sess` to `model` (name from the picker); returns the config in force."
 function setSessionModel!(sess, model::AbstractString)::AgentModelConfig
     base = sessionModelConfig(sess)
-    cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = String(model),
-                           monitorModel = base.monitorModel, apiKey = base.apiKey,
-                           reasoningField = base.reasoningField)
+    spec = resolveProviderForModel(model)
+    if spec === nothing
+        cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = String(model),
+                               monitorModel = base.monitorModel, apiKey = base.apiKey,
+                               reasoningField = base.reasoningField,
+                               maxOutputTokens = base.maxOutputTokens)
+    else
+        cfg = AgentModelConfig(baseUrl = spec.baseUrl, actorModel = String(model),
+                               monitorModel = base.monitorModel, apiKey = spec.apiKey,
+                               reasoningField = spec.reasoningField,
+                               maxOutputTokens = base.maxOutputTokens)
+    end
     lock(MODEL_BY_SESSION_LOCK) do
         MODEL_BY_SESSION[sess] = cfg
     end
@@ -324,6 +557,10 @@ function stripThinking(text::AbstractString)
     s = String(text)
     s = replace(s, r"<thinking>.*?</thinking>"s => "")
     s = replace(s, r"<thinking>.*$"s => "")
+    s = replace(s, r"<think>.*?</think>"s => "")
+    s = replace(s, r"<think>.*$"s => "")
+    s = replace(s, r"<\|thought_begin\|>.*?<\|thought_end\|>"s => "")
+    s = replace(s, r"<\|thought_begin\|>.*$"s => "")
     return strip(s)
 end
 |
@@ -338,6 +575,8 @@ show what the model reasoned before acting.
 function extractThinking(text::AbstractString)
     s = String(text)
     m = match(r"<thinking>(.*?)</thinking>"s, s)
+    m === nothing && (m = match(r"<think>(.*?)</think>"s, s))
+    m === nothing && (m = match(r"<\|thought_begin\|>(.*?)<\|thought_end\|>"s, s))
     return m === nothing ? "" : String(m.captures[1])
 end
 |
@@ -391,9 +630,39 @@ function streamCompletion(baseUrl::AbstractString, model::AbstractString,
                           timeoutS::Real = 120.0,
                           streamTimeoutS::Real = STREAM_READ_TIMEOUT_S,
                           reasoningField::AbstractString = DEFAULT_REASONING_FIELD,
-                          maxTokens::Integer = 4096,
-                          jsonMode::Bool = false,
+                          maxTokens::Integer = DEFAULT_MAX_OUTPUT_TOKENS, jsonMode::Bool = false,
                           onThinking = nothing)::String
+    # llamacpp models: route through FlootyStreams' Ollama provider.
+    if startswith(String(model), "llamacpp:")
+        try
+            FlootyHub.registerWithFlooty!()
+            fresh = String(FlootyHub.hub_openai_url())
+            isempty(strip(fresh)) || (baseUrl = fresh)
+        catch err
+            @debug "FlootyHub url refresh failed" exception = (err, catch_backtrace())
+        end
+        isempty(strip(baseUrl)) && error(
+            "no base URL for model '$model' — the provider is not registered or its " *
+            "server is not running (for local GGUF models run `flootyhub serve`)")
+        root = replace(rtrimSlash(baseUrl), r"/v1$" => "")
+        provider = FlootyStreams.OllamaProvider(baseURL = root,
+                                                timeout = Int(round(timeoutS)))
+        wire = stripProviderPrefix(model)
+        opts = Dict{String,Any}("temperature" => Float64(temperature),
+                                 "num_predict" => Int(maxTokens))
+        ch = FlootyStreams.chat(provider, messages, wire, true, nothing, opts)
+        out = IOBuffer()
+        for resp in ch
+            c = resp.message.content
+            if c !== nothing && c isa AbstractString && !isempty(c)
+                print(out, c)
+            end
+        end
+        return String(take!(out))
+    end
+    isempty(strip(baseUrl)) && error(
+        "no base URL for model '$model' — the provider is not registered or its " *
+        "server is not running (for local GGUF models run `flootyhub serve`)")
     url = rtrimSlash(baseUrl) * "/chat/completions"
     bodyDict = Dict{String,Any}(
         "model" => String(model),
@@ -577,9 +846,24 @@ makeCompleteFn(cfg::AgentModelConfig, model::AbstractString;
                jsonMode::Bool = false,
                onThinking = nothing, stream::Bool = true) =
     messages -> begin
+        wire = stripProviderPrefix(model) # picker prefix → raw model id for the API
+        # llamacpp models are served by FlootyHub, whose address can change
+        # (port fallback, restart). Re-resolve on every call instead of
+        # trusting a baseUrl that may have been pinned while the server was
+        # down or on a different port.
+        baseUrl = cfg.baseUrl
+        if startswith(String(model), "llamacpp:")
+            try
+                FlootyHub.registerWithFlooty!()
+                fresh = FlootyHub.hub_openai_url()
+                isempty(strip(fresh)) || (baseUrl = String(fresh))
+            catch err
+                @debug "FlootyHub url refresh failed" exception = (err, catch_backtrace())
+            end
+        end
         if stream
             try
-                return streamCompletion(cfg.baseUrl, model, messages;
+                return streamCompletion(baseUrl, wire, messages;
                                         temperature = temperature, apiKey = cfg.apiKey,
                                         timeoutS = timeoutS,
                                         reasoningField = cfg.reasoningField,
@@ -590,7 +874,7 @@ makeCompleteFn(cfg::AgentModelConfig, model::AbstractString;
                 @debug "streamCompletion failed; falling back to one-shot" exception = err
             end
         end
-        return chatCompletion(cfg.baseUrl, model, messages;
+        return chatCompletion(baseUrl, wire, messages;
                               temperature = temperature, apiKey = cfg.apiKey,
                               timeoutS = timeoutS,
                               reasoningField = cfg.reasoningField,
@@ -601,3 +885,254 @@ actorCompleteFn(cfg::AgentModelConfig = defaultAgentModelConfig();
                 kwargs...) = makeCompleteFn(cfg, cfg.actorModel; jsonMode = true, kwargs...)
 monitorCompleteFn(cfg::AgentModelConfig = defaultAgentModelConfig();
                   kwargs...) = makeCompleteFn(cfg, cfg.monitorModel; jsonMode = true, kwargs...)
+const _P2P_PROVIDER = Ref{Any}(nothing)
+
+"""
+    p2pProvider() -> FlootyComputeProvider
+
+Process-wide singleton P2P provider. Wraps a local OllamaProvider so the node
+can both serve its own models and route to peers. Mirrors PeerCompute, where
+`wrapped` supplies serialization helpers and the self-target fallback.
+"""
+function p2pProvider()
+    cfg = AGENT_CONFIG[]
+    existing = _P2P_PROVIDER[]
+    if existing !== nothing && existing.nodeRunning
+        return existing
+    end
+    # No `wrapped` provider: Flooty is a pure client here. Setting one makes
+    # start_provider list the wrapped models over HTTP, which blocks while a
+    # large model is loading. Add `wrapped` only when this node must serve.
+    p = FlootyAbstract.create_provider_instance(:flootycompute; config = Dict{Symbol,Any}(
+        :p2pPort => cfg.p2pPort,
+        :apiPort => cfg.p2pApiPort,
+        :discovery_topic => cfg.discoveryTopic,
+        :bootstrap_peers => cfg.bootstrapPeers,
+        :enable_mdns => true,
+    ))
+    FlootyStreams.start_provider(p)
+    _P2P_PROVIDER[] = p
+    return p
+end
+function p2pChatCompletion(model::AbstractString, messages::Vector{OllamaMessage};
+                           maxTokens::Integer = DEFAULT_MAX_OUTPUT_TOKENS, jsonMode::Bool = false)
+    p = p2pProvider()
+    format = jsonMode ? "json" : nothing
+    options = Dict{String,Any}("num_predict" => Int(maxTokens))
+    resp = FlootyStreams.chat(p, messages, String(model), false, format, options, nothing)
+    content = resp.message.content === nothing ? "" : String(resp.message.content)
+    return withReasoning(content, "")
+end
+
+# ---- peer models -----------------------------------------------------------
+# The picker above lists what the LOCAL endpoint serves. Peers advertise their
+# own models over FlootyCompute, so when P2P is on we merge those in and keep
+# the two sets separate so the UI can group them.
+
+"Models advertised by reachable FlootyCompute peers (empty when P2P is off)."
+function peerAgentModels()::Vector{String}
+    cfg = AGENT_CONFIG[]
+    cfg.p2p || return String[]
+    # NEVER start a node here: this runs on the UI thread and start_provider is
+    # a blocking ccall. Only read a provider that is already running.
+    p = _P2P_PROVIDER[]
+    (p === nothing || !p.nodeRunning) && return String[]
+    out = String[]
+    try
+        for peer in FlootyStreams.discover_peers(p)
+            append!(out, peer.models)
+        end
+    catch err
+        @debug "peerAgentModels: discovery failed" exception = err
+    end
+    return sort!(unique!(out))
+end
+
+function _queryProviderModels(spec::ProviderSpec)::Vector{String}
+    cfg = AgentModelConfig(baseUrl = spec.baseUrl, apiKey = spec.apiKey)
+    return listAgentModels(cfg)
+end
+
+function _listLocalOllamaModels()::Vector{String}
+    spec = get(KNOWN_PROVIDERS, :ollama, nothing)
+    spec === nothing && return String[]
+    root = replace(rtrimSlash(spec.baseUrl), r"/v1$" => "")
+    ollamaReachable(baseUrl = spec.baseUrl, apiKey = spec.apiKey, timeoutS = 2.0) || return String[]
+    try
+        resp = HTTP.get(root * "/api/tags"; readtimeout = 10_000, retry = false)
+        parsed = JSON.parse(String(resp.body))
+        ids = String[]
+        for m in get(parsed, :models, ())
+            id = get(m, :name, nothing)
+            (id === nothing || isempty(strip(String(id)))) && continue
+            push!(ids, String(id))
+        end
+        return ["ollama:" * id for id in sort!(ids)]
+    catch err
+        @debug "_listLocalOllamaModels failed" exception = err
+        return String[]
+    end
+end
+
+function _listChutesModels()::Vector{String}
+    spec = get(KNOWN_PROVIDERS, :chutes, nothing)
+    spec === nothing && return String[]
+    isempty(spec.apiKey) && return String[]
+    models = _queryProviderModels(spec)
+    return ["chutes:" * id for id in models]
+end
+
+function _listSshOllamaModels()::Vector{String}
+    out = String[]
+    for r in lock(SSH_REMOTES_LOCK) do; collect(SSH_OLLAMA_REMOTES); end
+        append!(out, listSshOllamaModels(r))
+    end
+    return out
+end
+
+"""
+    _listLocalLlamaModels() -> Vector{String}
+
+List locally downloaded GGUF models via FlootyHub or FlootyLlamaModels (if loaded).
+Each name is prefixed with `llamacpp:` so the picker groups it and
+resolveProviderForModel can route it.
+"""
+function _listLocalLlamaModels()::Vector{String}
+    # FlootyHub is a direct dependency here; FlootyLlamaModels remains an
+    # optional legacy source loaded into Main.
+    try
+        models = FlootyHub.downloadedModels()
+        return ["llamacpp:" * String(k) for k in keys(models)]
+    catch err
+        @debug "FlootyHub.downloadedModels() failed" exception = err
+    end
+    isdefined(Main, :FlootyLlamaModels) || return String[]
+    mod = getfield(Main, :FlootyLlamaModels)
+    isdefined(mod, :downloadedModels) || return String[]
+    try
+        models = mod.downloadedModels()
+        return ["llamacpp:" * String(k) for k in keys(models)]
+    catch err
+        @debug "_listLocalLlamaModels via FlootyLlamaModels failed" exception = err
+    end
+    return String[]
+end
+
+function _allProviderGroups()::Vector{ProviderGroup}
+    if isempty(KNOWN_PROVIDERS)
+        merge!(KNOWN_PROVIDERS, _buildKnownProviders())
+    end
+    groups = ProviderGroup[]
+    # PoolSide: models already carry the poolside/ namespace.
+    psSpec = KNOWN_PROVIDERS[:poolside]
+    psModels = _queryProviderModels(psSpec)
+    isempty(psModels) || push!(groups, ProviderGroup(psSpec.name, psModels))
+    # Chutes
+    chModels = _listChutesModels()
+    isempty(chModels) || push!(groups, ProviderGroup("Chutes", chModels))
+    # Local Ollama
+    loModels = _listLocalOllamaModels()
+    isempty(loModels) || push!(groups, ProviderGroup("Ollama (local)", loModels))
+    # Local Llama.cpp models (via FlootyHub/FlootyLlamaModels)
+    lcModels = _listLocalLlamaModels()
+    isempty(lcModels) || push!(groups, ProviderGroup("Llama.cpp (local)", lcModels))
+    # SSH Ollama remotes
+    for r in lock(SSH_REMOTES_LOCK) do; collect(SSH_OLLAMA_REMOTES); end
+        m = listSshOllamaModels(r)
+        isempty(m) || push!(groups, ProviderGroup("Ollama (ssh:$(r))", m))
+    end
+    return groups
+end
+
+function refreshProviderGroups!()
+    @async begin
+        groups = try
+            _allProviderGroups()
+        catch err
+            @debug "refreshProviderGroups! failed" exception = err
+            ProviderGroup[]
+        end
+        lock(PROVIDER_GROUPS_LOCK) do
+            PROVIDER_GROUPS_CACHE[] = groups
+            PROVIDER_GROUPS_AT[] = time()
+        end
+        return nothing
+    end
+    return nothing
+end
+
+providerGroups(; refresh::Bool = false)::Vector{ProviderGroup} =
+    let (g, age) = lock(PROVIDER_GROUPS_LOCK) do
+        (copy(PROVIDER_GROUPS_CACHE[]), isempty(PROVIDER_GROUPS_CACHE[]) ? Inf :
+                                  time() - PROVIDER_GROUPS_AT[])
+    end
+        (refresh || isempty(g) || age > PROVIDER_GROUPS_TTL) && refreshProviderGroups!()
+        g
+    end
+
+"""
+    resolveProviderForModel(model) -> Union{ProviderSpec,Nothing}
+
+Map a model name to its `ProviderSpec` by checking picker-side prefixes
+(`ssh:`, `chutes:`, `poolside/`, `ollama:`). Models with no known prefix
+return `nothing`, so the caller falls back to the process default config
+(backward compat with `perTabModelProbe.jl`'s `model-A`/`model-B`/`model-C`).
+"""
+function resolveProviderForModel(model::AbstractString)::Union{ProviderSpec,Nothing}
+    m = String(model)
+    if startswith(m, "ssh:")
+        rest = m[5:end]            # after "ssh:"
+        idx = findfirst(":", rest)
+        if idx !== nothing
+            remote = rest[1:idx.start-1]
+            key = "ssh:" * remote
+            return get(SSH_OLLAMA_PROVIDERS, key, nothing)
+        end
+        return nothing
+    end
+    startswith(m, "chutes:") && return get(KNOWN_PROVIDERS, :chutes, nothing)
+    startswith(m, "poolside/") && return get(KNOWN_PROVIDERS, :poolside, nothing)
+    startswith(m, "ollama:") && return get(KNOWN_PROVIDERS, :ollama, nothing)
+    # llamacpp: prefix — local GGUF models managed by FlootyHub.
+    # Re-register the spec on each resolve so the base URL stays current:
+    # the hub's address can change when the port falls back or the server
+    # restarts. If FlootyHub is unavailable, guess the default port rather
+    # than baking an empty URL (which fails far downstream with a cryptic
+    # "missing or unsupported scheme in URL" error).
+    if startswith(m, "llamacpp:")
+        try
+            FlootyHub.registerWithFlooty!()
+        catch err
+            @debug "FlootyHub llamacpp re-registration failed" exception = (err, catch_backtrace())
+        end
+        spec = get(KNOWN_PROVIDERS, :llamacpp, nothing)
+        spec === nothing && (spec = ProviderSpec(
+            "Llama.cpp (local)", "http://127.0.0.1:11434/v1", "", "llamacpp:", "",
+            "thinking", DEFAULT_CONTEXT_LENGTH, :llamacpp, ""))
+        return spec
+    end
+    return nothing
+end
+
+"""
+    stripProviderPrefix(model) -> String
+
+Remove the picker-side prefix (`chutes:`, `ollama:`, `ssh:user@host:`) so the
+raw model id reaches the API; PoolSide ids already include `poolside/` in
+the wire name, so they pass through untouched.
+"""
+function stripProviderPrefix(model::AbstractString)::String
+    spec = resolveProviderForModel(String(model))
+    spec === nothing && return String(model)
+    prefix = spec.prefix
+    startswith(model, prefix) && return String(model[length(prefix)+1:end])
+    return String(model)
+end
+
+"Local vs peer model groups for the picker. A model served both ways stays local."
+function agentModelGroups()
+    local_models = availableAgentModels()
+    peer_only = [m for m in peerAgentModels() if !(m in local_models)]
+    return (local_models = local_models, peer_models = peer_only,
+            providers = providerGroups())
+end

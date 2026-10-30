@@ -9,6 +9,7 @@ using FlootyAbstract: AbstractMessage, AbstractPersistable, AbstractPersistenceB
 using FlootyBase: MessageItem
 using FlootyStreams: OllamaMessage, OllamaToolCall, OllamaToolCallFunction
 import FlootyStreams
+import FlootyHub
 using FlootyPTYLayer: ReplSession, startReplSession, agentWriteAndWait, closeSession!
 using StructTypes
 using JSON
@@ -65,6 +66,15 @@ function __init__()
                 # that surface, now keyed by the terminal id.
                 migrateChatMonitor!(root.id,
                     FlootyPTYLayer.sessionIdFor(sess); note_key = sess)
+            end
+            # SSH terminals: register the remote as an Ollama provider so the
+            # picker can list models over `ssh user@host ollama list`.
+            if Symbol(kind) == :ssh && !isempty(String(remote))
+                try
+                    registerSshOllamaRemote!(String(remote))
+                catch err
+                    @debug "registerSshOllamaRemote! failed" exception = err
+                end
             end
             startMonitor!(sess)
             startTrajectoryMonitor!(sess)
@@ -141,6 +151,9 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     savedConversations, loadConversation,
     contextLengthFor, contextUsage, estimateTokens, compactMessages!, formatTokens,
     sessionModelConfig, setSessionModel!, forgetSessionModel!,
+    resolveProviderForModel, stripProviderPrefix, ProviderSpec, ProviderGroup,
+    registerSshOllamaRemote!, listSshOllamaModels, refreshProviderGroups!,
+    agentModelGroups, providerGroups,
     CONTEXT_COMPACT_AT, CONTEXT_KEEP_LAST, DEFAULT_CONTEXT_LENGTH,
     AgentApp, agentApp, runAgentApp, appConversation, appConversations,
     runTerminalAgent!, lastAgentTranscript,
@@ -150,6 +163,10 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     resolveSplitTarget,
     startAgentRunner!, stopAgentRunner!, agentRunnerRunning, agentRunnerBusy
 
+
+# Eagerly populate the static provider registry so resolveProviderForModel and
+# setSessionModel! work before the first background refreshProviderGroups!().
+merge!(KNOWN_PROVIDERS, _buildKnownProviders())
 
 const ACTIVE_SESSION = Ref{Union{Nothing, ReplSession}}(nothing)
 const DEFAULT_SIDECAR = joinpath(".warp", "repl-status.md")
@@ -176,6 +193,17 @@ function configureAgent!(; actorModel::Union{Nothing,AbstractString} = nothing,
     cfg = AGENT_CONFIG[]
     if actorModel !== nothing
         cfg.actorModel = String(actorModel)
+        # llamacpp models are served by FlootyHub; keep the base URL in sync so
+        # headless runs (no session) do not fall back to the cloud default.
+        if startswith(String(actorModel), "llamacpp:")
+            try
+                FlootyHub.registerWithFlooty!()
+                fresh = String(FlootyHub.hub_openai_url())
+                isempty(strip(fresh)) || (cfg.baseUrl = fresh)
+            catch err
+                @debug "configureAgent!: FlootyHub url refresh failed" exception = (err, catch_backtrace())
+            end
+        end
     end
     if monitorModel !== nothing
         cfg.monitorModel = String(monitorModel)
@@ -206,11 +234,14 @@ function agentModelState(sessionId::AbstractString = "")
     end
     cfg = sess === nothing ? AGENT_CONFIG[] : sessionModelConfig(sess)
     # Non-blocking: bindings run on the UI's main thread (see availableAgentModels).
+    groups = agentModelGroups()
     return (current = cfg.actorModel,
             monitor = cfg.monitorModel,
-            available = availableAgentModels())
+            available = vcat(groups.local_models, groups.peer_models),
+            local_models = groups.local_models,
+            peer_models = groups.peer_models,
+            providers = groups.providers)
 end
-
 """
     selectMonitorModel(name, sessionId = "") :: NamedTuple(current, monitor, available)
 
