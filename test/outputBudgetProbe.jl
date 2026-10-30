@@ -10,8 +10,8 @@ function check(name, ok, detail = "")
     ok || push!(failures, name)
 end
 
-check("the config carries a 4096-token default",
-      Flooty.defaultAgentModelConfig().maxOutputTokens == 4096)
+check("the config carries a 32768-token default",
+      Flooty.defaultAgentModelConfig().maxOutputTokens == 32768)
 
 server = Sockets.listen(ip"127.0.0.1", 0)
 port = Sockets.getsockname(server)[2]

@@ -340,8 +340,11 @@ headless `runTerminalAgent!` runs keep their transcript in memory only, so
 scripts and probes never write to your home directory.
 
 A model configuration is per process (`AGENT_CONFIG`), settable from the page's
-model picker or `configureAgent!`; the endpoint/model default to the MiniMax
-actor model (`FLOOTY_ACTOR_MODEL` / `FLOOTY_MONITOR_MODEL` / `FLOOTY_API_KEY`).
+model picker or `configureAgent!`; the endpoint/model default to the PoolSide
+Laguna S 2.1 actor model (`FLOOTY_ACTOR_MODEL` / `FLOOTY_MONITOR_MODEL` /
+|`FLOOTY_API_KEY`, falling back to `POOLSIDE_API_KEY`), with a 32768-token
+max output budget (the PoolSide API's enforced limit) and `reasoning_content`
+as the reasoning field.
 
 ## Future plans
 

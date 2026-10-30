@@ -4,6 +4,7 @@ using Dates
 using UUIDs
 using FlootyPTYLayer
 import FlootySessions
+import FlootyHub
 import FlootyAbstract
 using FlootyAbstract: AbstractMessage, AbstractPersistable, AbstractPersistenceBackend
 using FlootyBase: MessageItem

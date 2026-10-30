@@ -979,13 +979,11 @@ resolveProviderForModel can route it.
 function _listLocalLlamaModels()::Vector{String}
     # FlootyHub is a direct dependency here; FlootyLlamaModels remains an
     # optional legacy source loaded into Main.
-    if isdefined(Main, :FlootyHub)
-        try
-            models = getfield(Main, :FlootyHub).downloadedModels()
-            return ["llamacpp:" * String(k) for k in keys(models)]
-        catch err
-            @debug "FlootyHub.downloadedModels() failed" exception = err
-        end
+    try
+        models = FlootyHub.downloadedModels()
+        return ["llamacpp:" * String(k) for k in keys(models)]
+    catch err
+        @debug "FlootyHub.downloadedModels() failed" exception = err
     end
     isdefined(Main, :FlootyLlamaModels) || return String[]
     mod = getfield(Main, :FlootyLlamaModels)

@@ -13,7 +13,7 @@
 
 const CONTEXT_LENGTH_CACHE = Dict{String,Int}()
 const CONTEXT_LENGTH_LOCK = ReentrantLock()
-const DEFAULT_CONTEXT_LENGTH = 32_768      # when nothing reports a window
+const DEFAULT_CONTEXT_LENGTH = 262_144     # 256K: when nothing reports a window
 const CONTEXT_COMPACT_AT = 0.85            # auto-compact at 85% of the window
 const CONTEXT_KEEP_LAST = 24               # messages kept verbatim by compaction
 
@@ -26,7 +26,12 @@ then `/v1/models` entries) → `DEFAULT_CONTEXT_LENGTH`. Cached per model+endpoi
 """
 function contextLengthFor(model::AbstractString;
                           baseUrl::AbstractString = AGENT_CONFIG[].baseUrl)::Int
-    key = String(model) * "@" * String(baseUrl)
+    # Resolve provider-specific endpoint: a prefixed model (ssh:, chutes:, ollama:)
+    # routes to the provider registry's baseUrl; an unknown model keeps the
+    # caller-supplied one (backward compat with model-A/model-B/model-C probes).
+    spec = resolveProviderForModel(String(model))
+    effBase = spec === nothing ? String(baseUrl) : spec.baseUrl
+    key = String(model) * "@" * String(effBase)
     override = tryparse(Int, get(ENV, "FLOOTY_CONTEXT_LENGTH", ""))
     override !== nothing && override > 0 && return override
     lock(CONTEXT_LENGTH_LOCK) do
@@ -35,7 +40,7 @@ function contextLengthFor(model::AbstractString;
         CONTEXT_LENGTH_CACHE[key]
     end
 
-    found = _queryContextLength(String(model), String(baseUrl))
+    found = _queryContextLength(String(stripProviderPrefix(String(model))), String(effBase))
     limit = found > 0 ? found : DEFAULT_CONTEXT_LENGTH
     lock(CONTEXT_LENGTH_LOCK) do
         CONTEXT_LENGTH_CACHE[key] = limit
