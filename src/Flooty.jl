@@ -9,7 +9,6 @@ using FlootyAbstract: AbstractMessage, AbstractPersistable, AbstractPersistenceB
 using FlootyBase: MessageItem
 using FlootyStreams: OllamaMessage, OllamaToolCall, OllamaToolCallFunction
 import FlootyStreams
-import FlootyHub
 using FlootyPTYLayer: ReplSession, startReplSession, agentWriteAndWait, closeSession!
 using StructTypes
 using JSON
@@ -193,17 +192,8 @@ function configureAgent!(; actorModel::Union{Nothing,AbstractString} = nothing,
     cfg = AGENT_CONFIG[]
     if actorModel !== nothing
         cfg.actorModel = String(actorModel)
-        # llamacpp models are served by FlootyHub; keep the base URL in sync so
-        # headless runs (no session) do not fall back to the cloud default.
-        if startswith(String(actorModel), "llamacpp:")
-            try
-                FlootyHub.registerWithFlooty!()
-                fresh = String(FlootyHub.hub_openai_url())
-                isempty(strip(fresh)) || (cfg.baseUrl = fresh)
-            catch err
-                @debug "configureAgent!: FlootyHub url refresh failed" exception = (err, catch_backtrace())
-            end
-        end
+        # llamacpp models: base URL comes from FlootyStreams.LLAMACPP_BASE_URL,
+        # which FlootyHub publishes when it serves. No hardcoded hub calls here.
     end
     if monitorModel !== nothing
         cfg.monitorModel = String(monitorModel)

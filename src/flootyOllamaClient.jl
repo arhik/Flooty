@@ -15,7 +15,6 @@
 using HTTP
 using BufferedStreams: BufferedInputStream
 import FlootyStreams
-import FlootyHub
 |
 """
 Config for remote agent models. Construct via `defaultAgentModelConfig()` so
@@ -324,17 +323,10 @@ function chatCompletion(baseUrl::AbstractString, model::AbstractString,
     # llamacpp models: route through FlootyStreams' Ollama provider (FlootyHub
     # is Ollama-compatible), so streaming/thinking handling is unified.
     if startswith(String(model), "llamacpp:")
-        try
-            FlootyHub.registerWithFlooty!()
-            fresh = String(FlootyHub.hub_openai_url())
-            isempty(strip(fresh)) || (baseUrl = fresh)
-        catch err
-            @debug "FlootyHub url refresh failed" exception = (err, catch_backtrace())
-        end
-        isempty(strip(baseUrl)) && error(
-            "no base URL for model '$model' — the provider is not registered or its " *
-            "server is not running (for local GGUF models run `flootyhub serve`)")
-        root = replace(rtrimSlash(baseUrl), r"/v1$" => "")
+        root = FlootyStreams.LLAMACPP_BASE_URL[]
+        isempty(strip(root)) && error(
+            "no base URL for model '$model' — FlootyHub is not serving " *
+            "(run `flootyhub serve`)")
         provider = FlootyStreams.OllamaProvider(baseURL = root,
                                                 timeout = Int(round(timeoutS)))
         wire = stripProviderPrefix(model)
@@ -634,17 +626,10 @@ function streamCompletion(baseUrl::AbstractString, model::AbstractString,
                           onThinking = nothing)::String
     # llamacpp models: route through FlootyStreams' Ollama provider.
     if startswith(String(model), "llamacpp:")
-        try
-            FlootyHub.registerWithFlooty!()
-            fresh = String(FlootyHub.hub_openai_url())
-            isempty(strip(fresh)) || (baseUrl = fresh)
-        catch err
-            @debug "FlootyHub url refresh failed" exception = (err, catch_backtrace())
-        end
-        isempty(strip(baseUrl)) && error(
-            "no base URL for model '$model' — the provider is not registered or its " *
-            "server is not running (for local GGUF models run `flootyhub serve`)")
-        root = replace(rtrimSlash(baseUrl), r"/v1$" => "")
+        root = FlootyStreams.LLAMACPP_BASE_URL[]
+        isempty(strip(root)) && error(
+            "no base URL for model '$model' — FlootyHub is not serving " *
+            "(run `flootyhub serve`)")
         provider = FlootyStreams.OllamaProvider(baseURL = root,
                                                 timeout = Int(round(timeoutS)))
         wire = stripProviderPrefix(model)
@@ -853,13 +838,7 @@ makeCompleteFn(cfg::AgentModelConfig, model::AbstractString;
         # down or on a different port.
         baseUrl = cfg.baseUrl
         if startswith(String(model), "llamacpp:")
-            try
-                FlootyHub.registerWithFlooty!()
-                fresh = FlootyHub.hub_openai_url()
-                isempty(strip(fresh)) || (baseUrl = String(fresh))
-            catch err
-                @debug "FlootyHub url refresh failed" exception = (err, catch_backtrace())
-            end
+            baseUrl = FlootyStreams.LLAMACPP_BASE_URL[]
         end
         if stream
             try
@@ -1000,11 +979,13 @@ resolveProviderForModel can route it.
 function _listLocalLlamaModels()::Vector{String}
     # FlootyHub is a direct dependency here; FlootyLlamaModels remains an
     # optional legacy source loaded into Main.
-    try
-        models = FlootyHub.downloadedModels()
-        return ["llamacpp:" * String(k) for k in keys(models)]
-    catch err
-        @debug "FlootyHub.downloadedModels() failed" exception = err
+    if isdefined(Main, :FlootyHub)
+        try
+            models = getfield(Main, :FlootyHub).downloadedModels()
+            return ["llamacpp:" * String(k) for k in keys(models)]
+        catch err
+            @debug "FlootyHub.downloadedModels() failed" exception = err
+        end
     end
     isdefined(Main, :FlootyLlamaModels) || return String[]
     mod = getfield(Main, :FlootyLlamaModels)
@@ -1100,14 +1081,9 @@ function resolveProviderForModel(model::AbstractString)::Union{ProviderSpec,Noth
     # than baking an empty URL (which fails far downstream with a cryptic
     # "missing or unsupported scheme in URL" error).
     if startswith(m, "llamacpp:")
-        try
-            FlootyHub.registerWithFlooty!()
-        catch err
-            @debug "FlootyHub llamacpp re-registration failed" exception = (err, catch_backtrace())
-        end
         spec = get(KNOWN_PROVIDERS, :llamacpp, nothing)
         spec === nothing && (spec = ProviderSpec(
-            "Llama.cpp (local)", "http://127.0.0.1:11434/v1", "", "llamacpp:", "",
+            "Llama.cpp (local)", FlootyStreams.LLAMACPP_BASE_URL[] * "/v1", "", "llamacpp:", "",
             "thinking", DEFAULT_CONTEXT_LENGTH, :llamacpp, ""))
         return spec
     end
