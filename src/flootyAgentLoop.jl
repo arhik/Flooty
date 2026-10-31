@@ -1959,36 +1959,6 @@ function runAgentLoop!(sess::ReplSession, task::AbstractString;
                   OllamaMessage(role = "assistant", content = stripThinking(reply),
                                 thinking = isempty(thinking) ? nothing : String(thinking)))
             action = extractActionJson(stripThinking(reply))
-            # A local/chat model often answers with a plain JSON object such as
-            # {"reply":"..."} instead of an action schema. Treat its text as a
-            # feedback action (shown to the user / recorded) rather than as a
-            # terminal failure that poisons the rest of the run.
-            if action !== nothing && !haskey(action, "action")
-                body = ""
-                for key in (:reply, :message, :content, :text, :answer, :summary)
-                    v = get(action, key, nothing)
-                    v !== nothing && (body = String(v); break)
-                end
-                if isempty(strip(body))
-                    parts = String[]
-                    for (k, v) in action
-                        if v isa AbstractString && !isempty(strip(String(v)))
-                            push!(parts, String(v))
-                        end
-                    end
-                    body = join(parts, " ")
-                end
-                if !isempty(strip(body))
-                    action = JSON.parse(JSON.json(Dict(
-                        "action" => "feedback",
-                        "title"   => "Agent",
-                        "body"     => String(body),
-                        "kind"     => "info",
-                    )))
-                else
-                    action = nothing
-                end
-            end
             if action === nothing || !haskey(action, "action")
                 # The model answered in a provider's own tool-call syntax instead of
                 # our JSON. Translate it (and say so) rather than stopping as
