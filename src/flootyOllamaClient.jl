@@ -110,6 +110,13 @@ const SSH_OLLAMA_PROVIDERS = Dict{String,ProviderSpec}()
 const SSH_OLLAMA_REMOTES = Set{String}()
 const SSH_REMOTES_LOCK = ReentrantLock()
 
+# SSH FlootyHub remotes (FlootyHub running on an SSH target).
+const SSH_HUB_PROVIDERS = Dict{String,ProviderSpec}()
+const SSH_HUB_REMOTES = Set{String}()
+const SSH_HUB_MODELS_CACHE = Dict{String,Vector{String}}()
+const SSH_HUB_MODELS_AT = Dict{String,Float64}()
+const SSH_HUB_MODELS_LOCK = ReentrantLock()
+
 # TTL caches for multi-provider discovery.
 const PROVIDER_GROUPS_CACHE = Ref{Vector{ProviderGroup}}(ProviderGroup[])
 const PROVIDER_GROUPS_AT = Ref(0.0)
@@ -186,6 +193,66 @@ function listSshOllamaModels(remote::AbstractString; refresh::Bool = false)
     lock(SSH_OLLAMA_MODELS_LOCK) do
         SSH_OLLAMA_MODELS_CACHE[r] = out
         SSH_OLLAMA_MODELS_AT[r] = time()
+    end
+    return out
+end
+
+"""
+    registerSshFlootyHubRemote!(remote) -> ProviderSpec
+Register an SSH target that is running a FlootyHub server (`flootyhub serve`),
+so the picker can list and route to its models via `ssh remote flootyhub list`.
+"""
+function registerSshFlootyHubRemote!(remote::AbstractString)
+    r = String(remote)
+    isempty(r) && return nothing
+    lock(SSH_REMOTES_LOCK) do
+        push!(SSH_HUB_REMOTES, r)
+        key = "sshhub:" * r
+        if !haskey(SSH_HUB_PROVIDERS, key)
+            SSH_HUB_PROVIDERS[key] = ProviderSpec(
+                "FlootyHub (ssh:$(r))", "http://127.0.0.1:4434/v1", "",
+                key * ":", "", "thinking", DEFAULT_CONTEXT_LENGTH, :ssh, r)
+        end
+        return SSH_HUB_PROVIDERS[key]
+    end
+end
+
+"""
+    listSshFlootyHubModels(remote; refresh=false) -> Vector{String}
+Model names reported by `ssh remote flootyhub list`, each prefixed with
+`sshhub:remote:` so the picker groups it under the right target.
+"""
+function listSshFlootyHubModels(remote::AbstractString; refresh::Bool = false)
+    r = String(remote)
+    isempty(r) && return String[]
+    cached = lock(SSH_HUB_MODELS_LOCK) do
+        if !refresh && haskey(SSH_HUB_MODELS_CACHE, r)
+            age = time() - get(SSH_HUB_MODELS_AT, r, 0.0)
+            age < PROVIDER_GROUPS_TTL ? copy(SSH_HUB_MODELS_CACHE[r]) : String[]
+        else
+            String[]
+        end
+    end
+    (!isempty(cached) && !refresh) && return cached
+    out = String[]
+    try
+        cmd = `ssh -o ConnectTimeout=5 -o BatchMode=yes $r "export PATH=\$HOME/.julia/bin:\$PATH; flootyhub list"`
+        raw = read(cmd, String)
+        for line in split(raw, '\n')
+            line = strip(line)
+            isempty(line) && continue
+            startswith(lowercase(line), "name") && continue
+            m = match(r"^(\S+)", line)
+            m === nothing && continue
+            name = String(m.captures[1])
+            push!(out, "sshhub:" * r * ":" * name)
+        end
+    catch err
+        @debug "listSshFlootyHubModels failed" remote = r exception = err
+    end
+    lock(SSH_HUB_MODELS_LOCK) do
+        SSH_HUB_MODELS_CACHE[r] = out
+        SSH_HUB_MODELS_AT[r] = time()
     end
     return out
 end
@@ -1037,6 +1104,11 @@ function _allProviderGroups()::Vector{ProviderGroup}
         m = listSshOllamaModels(r)
         isempty(m) || push!(groups, ProviderGroup("Ollama (ssh:$(r))", m))
     end
+    # SSH FlootyHub remotes.
+    for r in lock(SSH_REMOTES_LOCK) do; collect(SSH_HUB_REMOTES); end
+        m = listSshFlootyHubModels(r)
+        isempty(m) || push!(groups, ProviderGroup("FlootyHub (ssh:$(r))", m))
+    end
     return groups
 end
 
@@ -1083,6 +1155,17 @@ function resolveProviderForModel(model::AbstractString)::Union{ProviderSpec,Noth
             remote = rest[1:idx.start-1]
             key = "ssh:" * remote
             return get(SSH_OLLAMA_PROVIDERS, key, nothing)
+        end
+        return nothing
+    end
+    # sshhub:remote:model -> a remote FlootyHub OpenAI endpoint.
+    if startswith(m, "sshhub:")
+        rest = m[8:end]   # after "sshhub:"
+        idx = findfirst(":", rest)
+        if idx !== nothing
+            remote = rest[1:idx.start-1]
+            key = "sshhub:" * remote
+            return get(SSH_HUB_PROVIDERS, key, nothing)
         end
         return nothing
     end

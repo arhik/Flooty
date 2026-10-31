@@ -68,12 +68,19 @@ function __init__()
                     FlootyPTYLayer.sessionIdFor(sess); note_key = sess)
             end
             # SSH terminals: register the remote as an Ollama provider so the
-            # picker can list models over `ssh user@host ollama list`.
+            # picker can list models over `ssh user@host ollama list`. Also
+            # register a FlootyHub provider for models managed by flootyhub on
+            # the remote machine (list via `ssh remote flootyhub list`).
             if Symbol(kind) == :ssh && !isempty(String(remote))
                 try
                     registerSshOllamaRemote!(String(remote))
                 catch err
                     @debug "registerSshOllamaRemote! failed" exception = err
+                end
+                try
+                    registerSshFlootyHubRemote!(String(remote))
+                catch err
+                    @debug "registerSshFlootyHubRemote! failed" exception = err
                 end
             end
             startMonitor!(sess)
@@ -152,7 +159,8 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     contextLengthFor, contextUsage, estimateTokens, compactMessages!, formatTokens,
     sessionModelConfig, setSessionModel!, forgetSessionModel!,
     resolveProviderForModel, stripProviderPrefix, ProviderSpec, ProviderGroup,
-    registerSshOllamaRemote!, listSshOllamaModels, refreshProviderGroups!,
+    registerSshOllamaRemote!, registerSshFlootyHubRemote!, listSshOllamaModels,
+    listSshFlootyHubModels, refreshProviderGroups!,
     agentModelGroups, providerGroups,
     CONTEXT_COMPACT_AT, CONTEXT_KEEP_LAST, DEFAULT_CONTEXT_LENGTH,
     AgentApp, agentApp, runAgentApp, appConversation, appConversations,
