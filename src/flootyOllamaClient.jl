@@ -229,8 +229,11 @@ function registerSshFlootyHubRemote!(remote::AbstractString)
             end
         end
         if !haskey(SSH_HUB_PROVIDERS, key)
+            hostpart = r
+            idx_at = findlast('@', hostpart)
+            idx_at !== nothing && (hostpart = hostpart[idx_at+1:end])
             SSH_HUB_PROVIDERS[key] = ProviderSpec(
-                "FlootyHub (ssh:$(r))", "http://127.0.0.1:4434/v1", "",
+                "FlootyHub (ssh:$(r))", "http://$(hostpart):4434/v1", "",
                 key * ":", "", "thinking", DEFAULT_CONTEXT_LENGTH, :ssh, r)
         end
         return SSH_HUB_PROVIDERS[key]
