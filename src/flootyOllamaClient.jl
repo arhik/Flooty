@@ -117,6 +117,12 @@ const SSH_HUB_MODELS_CACHE = Dict{String,Vector{String}}()
 const SSH_HUB_MODELS_AT = Dict{String,Float64}()
 const SSH_HUB_MODELS_LOCK = ReentrantLock()
 
+# Background SSH port-forwards for remote FlootyHub providers. They are
+# started on registration so selected `sshhub:...` models reach 127.0.0.1:4434
+# without manually running `ssh -L`.
+const SSH_HUB_TUNNELS = Dict{String,Base.Process}()
+const SSH_HUB_TUNNELS_LOCK = ReentrantLock()
+
 # TTL caches for multi-provider discovery.
 const PROVIDER_GROUPS_CACHE = Ref{Vector{ProviderGroup}}(ProviderGroup[])
 const PROVIDER_GROUPS_AT = Ref(0.0)
@@ -208,6 +214,20 @@ function registerSshFlootyHubRemote!(remote::AbstractString)
     lock(SSH_REMOTES_LOCK) do
         push!(SSH_HUB_REMOTES, r)
         key = "sshhub:" * r
+        # Launch a detached `-L 4434:localhost:4434` if no tunnel yet (and
+        # only if local port is not already answered by a running service).
+        lock(SSH_HUB_TUNNELS_LOCK) do
+            proc = get(SSH_HUB_TUNNELS, key, nothing)
+            if proc === nothing
+                try
+                    cmd = `ssh -f -N -o ConnectTimeout=10 -o BatchMode=yes -o ExitOnForwardFailure=yes -L 4434:localhost:4434 $r`
+                    proc = run(cmd; wait=false)
+                    SSH_HUB_TUNNELS[key] = proc
+                catch err
+                    @debug "ssh FlootyHub tunnel failed" remote = r exception = err
+                end
+            end
+        end
         if !haskey(SSH_HUB_PROVIDERS, key)
             SSH_HUB_PROVIDERS[key] = ProviderSpec(
                 "FlootyHub (ssh:$(r))", "http://127.0.0.1:4434/v1", "",
