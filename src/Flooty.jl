@@ -83,6 +83,9 @@ function __init__()
                     @debug "registerSshFlootyHubRemote! failed" exception = err
                 end
                 try
+                    lock(PROVIDER_GROUPS_LOCK) do
+                        PROVIDER_GROUPS_AT[] = 0.0
+                    end
                     refreshProviderGroups!()
                 catch err
                     @debug "refreshProviderGroups failed" exception = err
