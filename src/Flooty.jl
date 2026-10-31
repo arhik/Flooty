@@ -82,6 +82,11 @@ function __init__()
                 catch err
                     @debug "registerSshFlootyHubRemote! failed" exception = err
                 end
+                try
+                    refreshProviderGroups!()
+                catch err
+                    @debug "refreshProviderGroups failed" exception = err
+                end
             end
             startMonitor!(sess)
             startTrajectoryMonitor!(sess)
