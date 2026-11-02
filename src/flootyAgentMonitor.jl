@@ -2,7 +2,7 @@
 #
 # An @async task samples the session every pollS seconds and turns episodes
 # into AgentFeedback events (bridged to UI popups by default):
-#   * a statement executing longer than interjectAfterS → lfm2.5-thinking
+#   * a statement executing longer than interjectAfterS → a thinking model
 #     decides: observe silently / popup an insight / request interrupt
 #     (interrupt only auto-fires when allowInterrupt=true was configured AND
 #     the agent owns the run; user-owned runs get a popup, never Ctrl+C).
@@ -601,7 +601,8 @@ function sampleOnce!(state::MonitorState)
                         pending = pendingText, at_prompt = atPrompt, ps2 = ps2,
                         elapsed_s = elapsed, silence_s = elapsed,
                         grace_s = state.cfg.ps2GraceS,
-                        tau_s = state.cfg.hazardTauS)
+                        tau_s = state.cfg.hazardTauS,
+                        decision_model = sessionModelConfig(sess).decisionModel)
                 catch
                     nothing
                 end

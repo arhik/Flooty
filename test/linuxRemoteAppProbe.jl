@@ -42,6 +42,16 @@ if isempty(host)
 end
 println("host=", host)
 
+# Optional: exercise the probe with a remote FlootyHub model instead of the
+# process default. Usage:
+#   FLOOTY_REMOTE_MODEL=sshhub:HOST:MODEL \
+#     julia --project=. test/linuxRemoteAppProbe.jl
+remoteModel = get(ENV, "FLOOTY_REMOTE_MODEL", "")
+if !isempty(remoteModel)
+    Flooty.registerSshFlootyHubRemote!(host)
+    Flooty.AGENT_CONFIG[].maxOutputTokens = 1024
+end
+
 wv = L.launchTerminalUI()
 const REPORT = Ref("")
 
@@ -90,6 +100,9 @@ function run()
                               waitPrompt = false, rows = 30, cols = 100)
     id = L.adoptSessionTerminal!(sess; name = "linux-remote")
     println("tab session id=", id)
+    if !isempty(remoteModel)
+        println("model cfg: ", Flooty.setSessionModel!(sess, remoteModel))
+    end
 
     # Wait for the REMOTE prompt through the pane's own viewport (the agent's input).
     t0 = time()

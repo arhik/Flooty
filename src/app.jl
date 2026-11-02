@@ -57,13 +57,73 @@ agent turn is written through to `sessionsDir` (default `~/.flooty/conversations
 as it happens, and `conversationFor(id)` restores a stored transcript under that
 id instead of starting empty.
 """
+const HUB_MAX_OUTPUT_TOKENS = 2048
+
+function _hub_default_actor()
+    auto_hub = lowercase(get(ENV, "FLOOTY_AUTO_HUB", "true")) in ("1", "true", "yes")
+    if !(auto_hub && isempty(strip(get(ENV, "FLOOTY_INFERENCE_URL", ""))) &&
+           isempty(strip(get(ENV, "FLOOTY_ACTOR_MODEL", ""))))
+        return nothing
+    end
+    models = try
+        FlootyHub.downloadedModels()
+    catch
+        Dict{String,String}()
+    end
+    try
+        FlootyHub.ensure_flootyhub_server!()
+    catch
+    end
+    isempty(models) && return nothing
+    # Model-agnostic: pick the largest installed model, never a name-specific
+    # preference. The user can always override it in the picker.
+    entries = try
+        [e for e in FlootyHub.installed_models() if haskey(models, e.name)]
+    catch
+        FlootyHub.ModelEntry[]
+    end
+    isempty(entries) && return sort(collect(keys(models)))[1]
+    best = entries[1]
+    for e in entries
+        e.size > best.size && (best = e)
+    end
+    return best.name
+end
+
 function agentApp(; cmd::Cmd = DEFAULT_CMD,
                   width::Union{Nothing,Integer} = nothing,
                   height::Union{Nothing,Integer} = nothing,
                   task::AbstractString = "",
                   sessionsDir::Union{Nothing,AbstractString} = nothing,
                   journalPath::Union{Nothing,AbstractString} = nothing)
-    AGENT_CONFIG[] = defaultAgentModelConfig()
+    actor = _hub_default_actor()
+    if actor !== nothing
+        base = try
+            FlootyHub.hub_openai_url()
+        catch
+            ""
+        end
+        isempty(strip(base)) && (base = "http://127.0.0.1:4434/v1")
+        try FlootyStreams.set_llamacpp_base_url!(String(base)) catch nothing end
+        AGENT_CONFIG[] = AgentModelConfig(
+            baseUrl = something(normalizeOllamaUrl(base), DEFAULT_BASE_URL),
+            actorModel = "llamacpp:" * actor,
+            monitorModel = something(nonempty(get(ENV, "FLOOTY_MONITOR_MODEL", "")),
+                                     "llamacpp:" * actor),
+            decisionModel = strip(get(ENV, "FLOOTY_DECISION_MODEL", "")),
+            apiKey = something(nonempty(get(ENV, "FLOOTY_API_KEY", "")),
+                               nonempty(get(ENV, "POOLSIDE_API_KEY", "")),
+                               DEFAULT_API_KEY),
+            reasoningField = haskey(ENV, "FLOOTY_REASONING_FIELD") ?
+                             String(ENV["FLOOTY_REASONING_FIELD"]) :
+                             DEFAULT_REASONING_FIELD,
+            maxOutputTokens = something(tryparse(Int, get(ENV, "FLOOTY_MAX_OUTPUT_TOKENS", "")),
+                                       actor === nothing ? DEFAULT_MAX_OUTPUT_TOKENS :
+                                                           HUB_MAX_OUTPUT_TOKENS),
+        )
+    else
+        AGENT_CONFIG[] = defaultAgentModelConfig()
+    end
     dir = sessionsDir === nothing ? nothing : String(sessionsDir)
     enableConversationPersistence!(dir)
     # The event journal is the durable half of the store: every recorded turn also

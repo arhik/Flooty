@@ -26,6 +26,8 @@ t0 = time()
 say(m) = (println("[PTM] ", round(time() - t0; digits = 2), "s ", m); flush(stdout))
 const tab = Ref("")
 const target = Ref("")
+const monitorTarget = Ref("")
+const decisionTarget = Ref("")
 
 function finish()
     R.disableJournalPersistence!()
@@ -50,10 +52,14 @@ function pickerValue(then)
         (function () {
             var sel = document.getElementById('modelSelect');
             var active = terminals[activeTerminalId] || {};
+            var mon = document.getElementById('monitorSelect');
+            var dec = document.getElementById('decisionSelect');
             window.flootyTerminalBufferReport(JSON.stringify({
                 terminal_id: '__ptm__',
                 text: JSON.stringify({ value: sel ? sel.value : null,
                                        options: sel ? sel.options.length : 0,
+                                       monitor: mon ? mon.value : null,
+                                       decision: dec ? dec.value : null,
                                        activeId: active.juliaId || null,
                                        tabModel: active.model || null })
             })).catch(function () {});
@@ -76,14 +82,21 @@ function stepChange(txt)
     say("picker state: " * txt)
     check("the picker is bound to THIS tab's session id",
           occursin("\"activeId\":\"" * tab[] * "\"", txt), txt)
-    # Drive the PAGE -> BINDING path the picker itself uses (with the tab id), so
-    # the assertion does not depend on the <select> having finished populating.
+    check("the monitor picker shows its OWN model",
+          occursin("\"monitor\":\"" * monitorTarget[] * "\"", txt), txt)
+    if !isempty(decisionTarget[])
+        check("the decision picker shows its OWN model",
+              occursin("\"decision\":\"" * decisionTarget[] * "\"", txt), txt)
+    end
+    # Drive the REAL picker interaction: setting the <select> and firing its
+    # change event goes through the page handler (including its generation
+    # guard), exactly as a user's click does.
     L.Webviews.eval!(wv, """
         (function () {
-            callJulia('flootySetModel', JSON.stringify({
-                model: """ * repr(target[]) * """,
-                terminal_id: """ * repr(tab[]) * """
-            })).catch(function () {});
+            var sel = document.getElementById('modelSelect');
+            if (!sel) return;
+            sel.value = """ * repr(target[]) * """;
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
         })();
     """)
     Webviews.set_timeout(function ()
@@ -103,6 +116,18 @@ function stepChange(txt)
             say("picker after change: " * txt2)
             check("the page remembers the model for that tab",
                   occursin("\"tabModel\":\"" * target[] * "\"", txt2), txt2)
+            check("choosing a driver leaves the monitor picker alone",
+                  occursin("\"monitor\":\"" * monitorTarget[] * "\"", txt2), txt2)
+            check("the backend monitor also stayed put",
+                  R.agentModelState(tab[]).monitor == monitorTarget[],
+                  R.agentModelState(tab[]).monitor)
+            if !isempty(decisionTarget[])
+                check("choosing a driver leaves the decision picker alone",
+                      occursin("\"decision\":\"" * decisionTarget[] * "\"", txt2), txt2)
+                check("the backend decision also stayed put",
+                      R.agentModelState(tab[]).decision == decisionTarget[],
+                      R.agentModelState(tab[]).decision)
+            end
             finish()
         end
     end, wv, 1.0)
@@ -119,15 +144,26 @@ function waitModels(attempt = 0)
         return Webviews.set_timeout(() -> waitModels(attempt + 1), wv, 0.25)
     end
     say("endpoint models: " * string(options))
-    defaultModel = R.defaultAgentModelConfig().actorModel
+    defaultModel = R.AGENT_CONFIG[].actorModel
     others = [m for m in options if m != defaultModel]
     if isempty(others)
         check("the endpoint offers a second model", false, options)
         return finish()
     end
-    target[] = others[1]
+    target[] = others[end]
+    monitorTarget[] = others[1]
+    R.selectMonitorModel(monitorTarget[], tab[])
+    checks = R.agentModelState(tab[])
+    if !isempty(checks.decision_models)
+        decisionTarget[] = checks.decision_models[1]
+        R.selectDecisionModel(decisionTarget[], tab[])
+    end
     check("the tab starts on the default", R.agentModelState(tab[]).current == defaultModel,
           R.agentModelState(tab[]).current)
+    check("monitor starts on its OWN model",
+          R.agentModelState(tab[]).monitor == monitorTarget[], R.agentModelState(tab[]).monitor)
+    R.refreshAgentModels!()
+    L.Webviews.eval!(wv, "if (typeof refreshAgentModels === 'function') refreshAgentModels();")
     Webviews.set_timeout(function ()
         pickerValue(stepChange)
     end, wv, 1.0)

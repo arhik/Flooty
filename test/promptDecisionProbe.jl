@@ -10,6 +10,10 @@ function check(name::String, ok::Bool, detail = "")
     ok || push!(failures, name)
 end
 
+withenv("FLOOTY_DECISION_MODEL" => "") do
+    check("no implicit decision model fallback", isempty(promptDecisionModel()))
+end
+
 calls = Ref(0)
 PROMPT_DECISION_STUB[] = (; kwargs...) -> (calls[] += 1;
     (ps2 = 0.7, running = 0.1, idle = 0.2))

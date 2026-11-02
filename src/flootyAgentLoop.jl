@@ -389,6 +389,10 @@ function recoverMarkdownCommand(reply::AbstractString)::Union{Nothing,String}
     cmd = lines[1]
     startswith(cmd, "\$") && (cmd = strip(cmd[2:end]))
     isempty(cmd) && return nothing
+    # A pasted shell prompt (`% user@host project %`) is prose, not a command.
+    occursin(r"^[%$#>]\s*\S+@\S+", cmd) && return nothing
+    (occursin(SHELL_COMMAND_RE, cmd) || occursin(JULIA_STATEMENT_RE, cmd)) ||
+        return nothing
     occursin(r"[.!?]\s*$", cmd) && return nothing
     return cmd
 end
@@ -1615,9 +1619,6 @@ function runAgentLoop!(sess::ReplSession, task::AbstractString;
     # corrective nudge and are NOT executed; 3 strikes stop the run.
     prevActionSig = ""
     repeatStuck = 0
-    lastSendSig = ""
-    sendRepeat = 0
-    sendDuplicateSkips = 0
     # UNPARSEABLE loop guard: the strike counters above only engage AFTER a
     # reply parses. A model parroting invalid JSON (observed live: granite4
     # emitting raw quotes inside feedback values, 6 turns straight) otherwise
@@ -2007,6 +2008,22 @@ function runAgentLoop!(sess::ReplSession, task::AbstractString;
                                                          "code" => md)))
                 end
             end
+            if action === nothing && jsonFailureKind(reply) === :prose
+                # Some chat-tuned models answer a completed step
+                # with prose instead of a `done` object. Reuse the short
+                # action-encoder prompt so the prose becomes one action
+                # instead of a dead-end.
+                prose = stripProviderMarkup(stripThinking(reply))
+                if !isempty(strip(prose))
+                    loopSay(ctx, "[turn $(ctx.result.turns + 1)] prose reply — " *
+                                 "encoding the intended action")
+                    encoded = encodeActionFromThinking(ctx, prose)
+                    if encoded !== nothing
+                        parsed = extractActionJson(stripThinking(encoded))
+                        parsed !== nothing && (action = parsed)
+                    end
+                end
+            end
             if action === nothing
                 # BYTE-FAITHFUL log: whitespace-flattening HIDES control
                 # characters (e.g. a literal raw newline inside a JSON string,
@@ -2015,6 +2032,21 @@ function runAgentLoop!(sess::ReplSession, task::AbstractString;
                 # transcript alone.
                 rawShown = stripProviderMarkup(stripThinking(reply))
                 isempty(strip(rawShown)) && (rawShown = String(reply))
+                # Generic local models regularly answer in prose instead of a
+                # Flooty action JSON object. Fall back to rendering that reply
+                # directly so the turn does not silently stall or crash.
+                if !isempty(strip(rawShown))
+                    ev = AgentTextEvent(sessionIdFor(ctx.sess), String(rawShown) * "\n")
+                    try
+                        recordAgentEvent!(ctx.conv, ev)
+                    catch
+                    end
+                    pushAgentEventToWindow(activeTerminalUiWebview(), ev)
+                    ctx.result.summary = first(String(rawShown), 800)
+                    loopSay(ctx, "[reply] " * first(replace(String(rawShown), r"\s+" => " "), 300))
+                    ctx.result.turns += 1
+                    break
+                end
                 noteAgentParseFailure!(ctx.sess, first(rawShown, 300))
                 warning = "[warn] unparseable model output (turn $(ctx.result.turns + 1)): " *
                           first(escape_string(rawShown), 200)
@@ -2069,38 +2101,11 @@ function runAgentLoop!(sess::ReplSession, task::AbstractString;
 
             kind = getstr(action, "action", "")
             ctx.result.turns += 1
-            # Non-send repeat detection (see prevActionSig comment).
+            # Non-send repeat detection (see prevActionSig comment). Sends are
+            # deliberately NOT deduplicated: rerunning an idempotent
+            # inspection is legitimate, and refusing it hides the terminal
+            # state the next turn needs.
             actionSig = replace(string(JSON.json(action)), r"\s+" => "")
-            # SEND REPEAT SAFETY: the monitor note can be present and a weak
-            # driver can still replay the same send forever (observed: 400
-            # identical turns). Let two occurrences through (a legitimate
-            # retry), then skip the third and stop after three skips. This is a
-            # harness stop, not a monitor interrupt and not a Ctrl+C.
-            if kind == "send"
-                if actionSig == lastSendSig
-                    sendRepeat += 1
-                else
-                    lastSendSig = actionSig
-                    sendRepeat = 0
-                    sendDuplicateSkips = 0
-                end
-                if sendRepeat >= 2
-                    sendDuplicateSkips += 1
-                    msg = "identical send repeated $(sendRepeat + 1) times; " *
-                          "its output cannot change — choose a different command or done"
-                    loopSay(ctx, "[loop-guard] " * msg)
-                    push!(ctx.monitorNotesPending, msg)
-                    if sendDuplicateSkips >= 3
-                        finalReport!(ctx, "stopped after repeated identical sends")
-                        break
-                    end
-                    continue
-                end
-            else
-                lastSendSig = ""
-                sendRepeat = 0
-                sendDuplicateSkips = 0
-            end
             # `wait` is deliberately NOT in this list: waiting IS the recovery
             # action when the pane is settling, and skipping it burns the turns
             # the model is trying to spend. Identical feedback/interrupt popups

@@ -51,19 +51,24 @@ end
 "Ask the endpoint (Ollama native first, OpenAI list second). 0 when unknown."
 function _queryContextLength(model::String, baseUrl::String)::Int
     root = replace(rstrip(baseUrl, '/'), r"/v1$" => "")
-    # 1. Ollama native: POST /api/show
-    try
-        resp = HTTP.post(root * "/api/show", ["Content-Type" => "application/json"],
-                         JSON.json(Dict("model" => model));
-                         readtimeout = 8000, retry = false)
-        body = String(resp.body)
-        # `model_info` carries one `<arch>.context_length` (e.g. beam.context_length)
-        for m in eachmatch(r"\"([a-zA-Z0-9_.-]*context_length)\"\s*:\s*(\d+)", body)
-            n = parse(Int, m.captures[2])
-            n > 0 && return n
+    # 1. Ollama native: POST /api/show. A FlootyHub that was just auto-started
+    # can accept /health a moment before /api/show is ready, so one retry.
+    for attempt in 1:2
+        try
+            resp = HTTP.post(root * "/api/show", ["Content-Type" => "application/json"],
+                             JSON.json(Dict("model" => model));
+                             readtimeout = 8000, retry = false)
+            body = String(resp.body)
+            # `model_info` carries one `<arch>.context_length` (e.g. beam.context_length)
+            for m in eachmatch(r"\"([a-zA-Z0-9_.-]*context_length)\"\s*:\s*(\d+)", body)
+                n = parse(Int, m.captures[2])
+                n > 0 && return n
+            end
+            break
+        catch err
+            @debug "context: /api/show failed" attempt exception = err
+            attempt == 1 && sleep(0.35)
         end
-    catch err
-        @debug "context: /api/show failed" exception = err
     end
     # 2. OpenAI-compatible list, when it carries per-model metadata
     try

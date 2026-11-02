@@ -54,6 +54,14 @@ try
           _tailAtIdlePrompt(tailText(sess.tail)), last(tailText(sess.tail), 120))
     tagIn(sess.control; mode = :agent)
 
+    # Optional remote model override for the agent loop at the end.
+    remoteModel = get(ENV, "FLOOTY_REMOTE_MODEL", "")
+    if !isempty(remoteModel)
+        Flooty.registerSshFlootyHubRemote!(host)
+        Flooty.AGENT_CONFIG[].maxOutputTokens = 1024
+        Flooty.setSessionModel!(sess, remoteModel)
+    end
+
     r1 = agentWriteAndWait(sess, "echo FL00TY_SEND_OK; uname -s"; timeout = 20.0)
     out1 = string(r1.excerpt)
     check("send resolves ok on Linux", r1.ok === true,

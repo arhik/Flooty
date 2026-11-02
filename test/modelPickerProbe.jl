@@ -4,7 +4,8 @@
 # agent package installs the controller (`addAgentModelHooks!`) and answers. This
 # probe drives the REAL page against the REAL endpoint:
 #   * the select is populated from `GET /v1/models` (and shows the model in force),
-#   * choosing an entry switches the process-wide config (actor AND monitor),
+#   * choosing an entry switches the process-wide ACTOR (the monitor has its
+#     own picker and must not be overwritten),
 #   * the page reflects the new choice,
 #   * and the original model is restored afterwards.
 #
@@ -86,7 +87,7 @@ function stepVerify(target::String)
     check("choosing a model switches the agent config (actor)", now.current == target;
           detail = "config says " * now.current)
     cfg = Flooty.AGENT_CONFIG[]
-    check("the monitor follows the actor", cfg.monitorModel == target;
+    check("choosing an actor leaves the monitor alone", cfg.monitorModel == before.monitor;
           detail = "monitor says " * cfg.monitorModel)
     Webviews.eval!(wv, """
     (function () {

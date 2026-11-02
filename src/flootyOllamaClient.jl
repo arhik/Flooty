@@ -19,13 +19,17 @@ import FlootyStreams
 """
 Config for remote agent models. Construct via `defaultAgentModelConfig()` so
 env overrides (`FLOOTY_INFERENCE_URL`, `FLOOTY_ACTOR_MODEL`,
-`FLOOTY_MONITOR_MODEL`, `FLOOTY_API_KEY` or `POOLSIDE_API_KEY`) are honored;
+`FLOOTY_MONITOR_MODEL`, `FLOOTY_DECISION_MODEL`, `FLOOTY_API_KEY` or
+`POOLSIDE_API_KEY`) are honored;
 fields stay mutable for `configureAgent!`.
 """
 Base.@kwdef mutable struct AgentModelConfig
     baseUrl::String = "https://inference.poolside.ai/v1"
     actorModel::String = "poolside/laguna-s-2.1"
     monitorModel::String = "poolside/laguna-s-2.1"
+    # Prompt-state decision model (separate from the driver and monitor).
+    # Empty disables the decision-model fallback; it is never chosen implicitly.
+    decisionModel::String = ""
     apiKey::String = ""
     # Which JSON field carries an assistant turn's REASONING on the REQUEST side.
     # Providers disagree (DeepSeek/Poolside/OpenRouter `reasoning_content`,
@@ -314,8 +318,10 @@ function defaultAgentModelConfig()
                             DEFAULT_BASE_URL),
         actorModel = something(nonempty(get(ENV, "FLOOTY_ACTOR_MODEL", "")),
                                DEFAULT_ACTOR_MODEL),
+        # Monitor is independent: do not derive it from FLOOTY_ACTOR_MODEL.
         monitorModel = something(nonempty(get(ENV, "FLOOTY_MONITOR_MODEL", "")),
                                  DEFAULT_MONITOR_MODEL),
+        decisionModel = strip(get(ENV, "FLOOTY_DECISION_MODEL", "")),
         # `FLOOTY_API_KEY` is the generic override; `POOLSIDE_API_KEY` is the
         # provider-specific one — check it second so it acts as a fallback when
         # the generic var is unset.
@@ -532,7 +538,12 @@ function availableAgentModels(; refresh::Bool = false)::Vector{String}
     for g in groups
         append!(out, g.models)
     end
-    return sort!(unique!(vcat(pCached, out)))
+    # The flat fallback list and the provider-grouped list must use the same
+    # ids. Raw Hub /v1/models ids arrive unprefixed; canonicalize them to the
+    # picker's `llamacpp:` form so a choice made before groups load still
+    # matches its option after they do.
+    return sort!(unique!(vcat(canonicalAgentModelName.(pCached),
+                              canonicalAgentModelName.(out))))
 end
 
 # ---- per-tab models ---------------------------------------------------------
@@ -551,16 +562,19 @@ end
 
 "Pin the AMBIENT MONITOR of `sess` to `model`; the actor keeps its own model."
 function setSessionMonitorModel!(sess, model::AbstractString)::AgentModelConfig
+    name = canonicalAgentModelName(model)
     base = sessionModelConfig(sess)
-    spec = resolveProviderForModel(model)
+    spec = resolveProviderForModel(name)
     if spec === nothing
         cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = base.actorModel,
-                               monitorModel = String(model), apiKey = base.apiKey,
+                               monitorModel = name, decisionModel = base.decisionModel,
+                               apiKey = base.apiKey,
                                reasoningField = base.reasoningField,
                                maxOutputTokens = base.maxOutputTokens)
     else
         cfg = AgentModelConfig(baseUrl = spec.baseUrl, actorModel = base.actorModel,
-                               monitorModel = String(model), apiKey = spec.apiKey,
+                               monitorModel = name, decisionModel = base.decisionModel,
+                               apiKey = spec.apiKey,
                                reasoningField = spec.reasoningField,
                                maxOutputTokens = base.maxOutputTokens)
     end
@@ -572,19 +586,38 @@ end
 
 "Pin `sess` to `model` (name from the picker); returns the config in force."
 function setSessionModel!(sess, model::AbstractString)::AgentModelConfig
+    name = canonicalAgentModelName(model)
     base = sessionModelConfig(sess)
-    spec = resolveProviderForModel(model)
+    spec = resolveProviderForModel(name)
     if spec === nothing
-        cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = String(model),
-                               monitorModel = base.monitorModel, apiKey = base.apiKey,
+        cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = name,
+                               monitorModel = base.monitorModel,
+                               decisionModel = base.decisionModel, apiKey = base.apiKey,
                                reasoningField = base.reasoningField,
                                maxOutputTokens = base.maxOutputTokens)
     else
-        cfg = AgentModelConfig(baseUrl = spec.baseUrl, actorModel = String(model),
-                               monitorModel = base.monitorModel, apiKey = spec.apiKey,
+        cfg = AgentModelConfig(baseUrl = spec.baseUrl, actorModel = name,
+                               monitorModel = base.monitorModel,
+                               decisionModel = base.decisionModel, apiKey = spec.apiKey,
                                reasoningField = spec.reasoningField,
                                maxOutputTokens = base.maxOutputTokens)
     end
+    lock(MODEL_BY_SESSION_LOCK) do
+        MODEL_BY_SESSION[sess] = cfg
+    end
+    return cfg
+end
+
+"Pin the DECISION model of `sess`; the driver and monitor keep their own choices."
+function setSessionDecisionModel!(sess, model::AbstractString)::AgentModelConfig
+    name = String(strip(model))
+    isempty(name) || (name = canonicalAgentModelName(name))
+    base = sessionModelConfig(sess)
+    cfg = AgentModelConfig(baseUrl = base.baseUrl, actorModel = base.actorModel,
+                           monitorModel = base.monitorModel, decisionModel = name,
+                           apiKey = base.apiKey,
+                           reasoningField = base.reasoningField,
+                           maxOutputTokens = base.maxOutputTokens)
     lock(MODEL_BY_SESSION_LOCK) do
         MODEL_BY_SESSION[sess] = cfg
     end
@@ -633,8 +666,7 @@ rtrimSlash(s::AbstractString) =
 """
     stripThinking(text) -> String
 
-Remove `<thinking>...</thinking>` reasoning blocks (thinking models like
-lfm2.5-thinking emit them before the answer). An unbalanced trailing
+Remove `<thinking>...</thinking>` reasoning blocks (thinking models emit them before the answer). An unbalanced trailing
 `<thinking>...` (still open at end) is dropped as well.
 """
 function stripThinking(text::AbstractString)
@@ -1121,7 +1153,7 @@ function _allProviderGroups()::Vector{ProviderGroup}
     isempty(loModels) || push!(groups, ProviderGroup("Ollama (local)", loModels))
     # Local Llama.cpp models (via FlootyHub/FlootyLlamaModels)
     lcModels = _listLocalLlamaModels()
-    isempty(lcModels) || push!(groups, ProviderGroup("Llama.cpp (local)", lcModels))
+    isempty(lcModels) || push!(groups, ProviderGroup("FlootyHub (local)", lcModels))
     # SSH Ollama remotes
     for r in lock(SSH_REMOTES_LOCK) do; collect(SSH_OLLAMA_REMOTES); end
         m = listSshOllamaModels(r)
@@ -1202,10 +1234,14 @@ function resolveProviderForModel(model::AbstractString)::Union{ProviderSpec,Noth
     # than baking an empty URL (which fails far downstream with a cryptic
     # "missing or unsupported scheme in URL" error).
     if startswith(m, "llamacpp:")
-        spec = get(KNOWN_PROVIDERS, :llamacpp, nothing)
-        spec === nothing && (spec = ProviderSpec(
-            "Llama.cpp (local)", FlootyStreams.LLAMACPP_BASE_URL[] * "/v1", "", "llamacpp:", "",
-            "thinking", DEFAULT_CONTEXT_LENGTH, :llamacpp, ""))
+        base = String(FlootyStreams.LLAMACPP_BASE_URL[])
+        isempty(strip(base)) && (base = "http://127.0.0.1:4434")
+        base = something(normalizeOllamaUrl(base), "http://127.0.0.1:4434/v1")
+        spec = ProviderSpec("FlootyHub (local)", base, "", "llamacpp:", "",
+                            "thinking", DEFAULT_CONTEXT_LENGTH, :llamacpp, "")
+        lock(KNOWN_PROVIDERS_LOCK) do
+            KNOWN_PROVIDERS[:llamacpp] = spec
+        end
         return spec
     end
     return nothing
@@ -1224,6 +1260,30 @@ function stripProviderPrefix(model::AbstractString)::String
     prefix = spec.prefix
     startswith(model, prefix) && return String(model[length(prefix)+1:end])
     return String(model)
+end
+
+"""
+    canonicalAgentModelName(model) -> String
+
+Return the picker's canonical id for `model`. Models served by the local
+FlootyHub are advertised with the `llamacpp:` prefix; a raw id from the flat
+`/v1/models` fallback gets the same prefix so it does not disappear when the
+grouped provider list arrives.
+"""
+function canonicalAgentModelName(model::AbstractString)::String
+    m = String(model)
+    isempty(strip(m)) && return m
+    for prefix in ("llamacpp:", "chutes:", "ollama:", "ssh:", "sshhub:",
+                   "poolside/")
+        startswith(m, prefix) && return m
+    end
+    models = try
+        FlootyHub.downloadedModels()
+    catch
+        nothing
+    end
+    models === nothing && return m
+    return haskey(models, m) ? "llamacpp:" * m : m
 end
 
 "Local vs peer model groups for the picker. A model served both ways stays local."

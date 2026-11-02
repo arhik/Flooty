@@ -103,7 +103,7 @@ function __init__()
     # The page's model picker: FlootyPTYLayer owns the bindings but knows nothing
     # about models, so the agent side answers for them.
     FlootyPTYLayer.addAgentModelHooks!(agentModelState, selectAgentModel,
-                                       selectMonitorModel)
+                                       selectMonitorModel, selectDecisionModel)
     FlootyPTYLayer.addChatOnlyHandler!(chatSessionTurn!)
     FlootyPTYLayer.addNewChatHandler!(newChatSessionHandler)
     FlootyPTYLayer.addChatCloseHandler!(closeChatSession!)
@@ -137,6 +137,7 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     AgentModelConfig, defaultAgentModelConfig, configureAgent!,
     chatCompletion, ollamaReachable, extractThinking,
     listAgentModels, agentModelState, selectAgentModel, selectMonitorModel,
+    selectDecisionModel,
     pushMonitorNote!, takeMonitorNotes!, setAgentBrief!, agentBriefFor,
     agentBriefPrompt, chatOnlyTurn!, seedChatThreadInto!,
     ChatSession, TerminalSession, BrowserSession, ensureRootChatSession!, rootChatSession,
@@ -151,7 +152,7 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     trajectoryToolResult!, trajectoryStatus!, trajectoryContext!, trajectoryTask!,
     noteUserMessage!, recordUserPreference!, preferencesContext, preferencesPath,
     preferenceProjectName, PREFERENCE_COMPLETE,
-    promptStatusDecision, ps2TimeHazard, PROMPT_DECISION_STUB,
+    promptDecisionModel, promptStatusDecision, ps2TimeHazard, PROMPT_DECISION_STUB,
     parseChatReply, launchChatTerminal!, launchChildChat!, newRootChatSession!,
     newChatSessionHandler, closeChatSession!, launchBrowserSession!, newBrowserSessionHandler,
     browserNavigateHandler, browserTurnFor!, BROWSER_COMPLETE, chatTurnFor!,
@@ -198,12 +199,13 @@ const _LAST_TRANSCRIPT_AT = IdDict{Any,Float64}()
 const _TRANSCRIPTS_LOCK = ReentrantLock()
 
 """
-    configureAgent!(; actorModel, monitorModel, baseUrl, apiKey) :: AgentModelConfig
+    configureAgent!(; actorModel, monitorModel, decisionModel, baseUrl, apiKey) :: AgentModelConfig
 
 Update the process-wide remote-model config. Unset kwargs keep current values.
 """
 function configureAgent!(; actorModel::Union{Nothing,AbstractString} = nothing,
                          monitorModel::Union{Nothing,AbstractString} = nothing,
+                         decisionModel::Union{Nothing,AbstractString} = nothing,
                          baseUrl::Union{Nothing,AbstractString} = nothing,
                          apiKey::Union{Nothing,AbstractString} = nothing)
     cfg = AGENT_CONFIG[]
@@ -215,6 +217,9 @@ function configureAgent!(; actorModel::Union{Nothing,AbstractString} = nothing,
     if monitorModel !== nothing
         cfg.monitorModel = String(monitorModel)
     end
+    if decisionModel !== nothing
+        cfg.decisionModel = strip(String(decisionModel))
+    end
     if baseUrl !== nothing
         normalized = normalizeOllamaUrl(String(baseUrl))
         cfg.baseUrl = normalized === nothing ? cfg.baseUrl : normalized
@@ -223,6 +228,22 @@ function configureAgent!(; actorModel::Union{Nothing,AbstractString} = nothing,
         cfg.apiKey = String(apiKey)
     end
     return cfg
+end
+
+"Models tagged with `role` in FlootyHub that are actually installed."
+function agentModelsForRole(role::AbstractString)
+    entries = try
+        FlootyHub.available_models()
+    catch
+        return String[]
+    end
+    models = String[]
+    for entry in entries
+        roles = isempty(entry.roles) ? ["chat"] : entry.roles
+        role in roles || continue
+        push!(models, canonicalAgentModelName(entry.name))
+    end
+    return sort!(unique!(models))
 end
 
 """
@@ -242,11 +263,14 @@ function agentModelState(sessionId::AbstractString = "")
     cfg = sess === nothing ? AGENT_CONFIG[] : sessionModelConfig(sess)
     # Non-blocking: bindings run on the UI's main thread (see availableAgentModels).
     groups = agentModelGroups()
-    return (current = cfg.actorModel,
-            monitor = cfg.monitorModel,
+    return (current = canonicalAgentModelName(cfg.actorModel),
+            monitor = canonicalAgentModelName(cfg.monitorModel),
+            decision = canonicalAgentModelName(cfg.decisionModel),
             available = vcat(groups.local_models, groups.peer_models),
             local_models = groups.local_models,
             peer_models = groups.peer_models,
+            decision_models = agentModelsForRole("decision"),
+            speech_models = agentModelsForRole("speech"),
             providers = groups.providers)
 end
 """
@@ -257,15 +281,38 @@ keeps its own model: the monitor runs short, frequent checks and is often better
 a different (cheaper or faster) model than the one driving the terminal.
 """
 function selectMonitorModel(name::AbstractString, sessionId::AbstractString = "")
+    model = canonicalAgentModelName(name)
     sess = try
         FlootyPTYLayer.sessionForTerminalId(String(sessionId))
     catch
         nothing
     end
     if sess === nothing
-        configureAgent!(monitorModel = String(name))
+        configureAgent!(monitorModel = model)
     else
-        setSessionMonitorModel!(sess, String(name))
+        setSessionMonitorModel!(sess, model)
+    end
+    return agentModelState(String(sessionId))
+end
+
+"""
+    selectDecisionModel(name, sessionId = "") :: NamedTuple(current, monitor, decision, available)
+
+Choose the prompt-state decision model for that tab, independently of the
+driver and monitor. An empty name disables the decision-model fallback.
+"""
+function selectDecisionModel(name::AbstractString, sessionId::AbstractString = "")
+    model = strip(name)
+    isempty(model) || (model = canonicalAgentModelName(model))
+    sess = try
+        FlootyPTYLayer.sessionForTerminalId(String(sessionId))
+    catch
+        nothing
+    end
+    if sess === nothing
+        configureAgent!(decisionModel = model)
+    else
+        setSessionDecisionModel!(sess, model)
     end
     return agentModelState(String(sessionId))
 end
@@ -279,6 +326,7 @@ one already running keeps the model it began with. Without a session id this
 changes the process default (headless runs, and tabs that never chose one).
 """
 function selectAgentModel(name::AbstractString, sessionId::AbstractString = "")
+    model = canonicalAgentModelName(name)
     sess = try
         FlootyPTYLayer.sessionForTerminalId(String(sessionId))
     catch
@@ -287,12 +335,12 @@ function selectAgentModel(name::AbstractString, sessionId::AbstractString = "")
     if sess === nothing
         # The monitor has its OWN picker now: choosing an agent model must not
         # silently overwrite an explicit monitor choice.
-        configureAgent!(actorModel = String(name))
+        configureAgent!(actorModel = model)
     else
-        setSessionModel!(sess, String(name))
+        setSessionModel!(sess, model)
         # The tab's transcript is tagged with the model that produced it.
         try
-            conversationFor(sess).model = String(name)
+            conversationFor(sess).model = model
         catch err
             @debug "selectAgentModel: conversation tag failed" exception = err
         end

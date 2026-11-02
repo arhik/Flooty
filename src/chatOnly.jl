@@ -15,20 +15,15 @@
 const CHAT_THREAD_ADOPTED = Ref(false)
 
 const CHAT_SYSTEM_PROMPT = """
-You are Flooty, a concise coding assistant in a chat window. NO TERMINAL IS OPEN.
-Answer questions, explain code and plan work directly and briefly.
-
-When the user asks for work that needs a real terminal — run commands, edit files,
-drive a REPL, test, build, install — OPEN one instead of describing it. Reply with
-EXACTLY ONE JSON object:
+You are Flooty, a concise coding assistant in a chat window. No terminal is open.
+Answer ordinary questions in plain text, briefly.
+When the user asks you to run commands, edit files, drive a REPL, test, build,
+install, or otherwise use a terminal, reply with exactly one JSON object and no
+other text:
 {"action":"terminal","task":"<precise instruction for the terminal agent>"}
-The terminal is seeded with this conversation and its attached agent starts on
-`task`; one terminal is enough. Do not tell the user to press Ctrl+Shift+T.
-To open a CHILD chat session (its own conversation and tab) reply with
-{"action":"chat","name":"<short name>"}; the new chat becomes active.
-For ordinary conversation reply with {"reply":"<concise markdown>"} (plain prose
-also works). Your reply MUST contain the JSON object even after reasoning: never
-end at reasoning alone.
+To open a separate chat session, reply with exactly one JSON object:
+{"action":"chat","name":"<short name>"}
+Do not describe terminal work instead of opening a terminal.
 """
 
 # Test hook: probes inject a completion instead of calling a model.
@@ -40,6 +35,8 @@ const CHAT_COMPLETE = Ref{Union{Nothing,Function}}(nothing)
 The chat driver may answer in prose, in `{"reply": …}`, or with the terminal tool
 `{"action":"terminal","task": …}`. `kind` is `:chat` or `:terminal`.
 """
+_placeholderActionValue(v) = occursin(r"<[^<>]*>", strip(String(v)))
+
 function parseChatReply(reply::AbstractString)
     raw = stripThinking(String(reply))
     act = extractActionJson(raw)
@@ -52,19 +49,45 @@ function parseChatReply(reply::AbstractString)
         catch
         end
     end
+    if act === nothing
+        fn = match(r"<function\s*=\s*([A-Za-z_]+)\s*>(.*?)(?:</function>|\z)"s,
+                   String(raw))
+        if fn !== nothing
+            name = lowercase(String(fn.captures[1]))
+            body = strip(String(fn.captures[2]))
+            params = providerParameters(body)
+            isempty(params) || (body = strip(params[1][2]))
+            pm = match(r"<parameter\s*=\s*[A-Za-z_]+\s*>(.*?)</parameter>"s, body)
+            pm === nothing || (body = strip(String(pm.captures[1])))
+            if name in ("terminal", "send", "run", "bash", "shell", "execute")
+                return (kind = :terminal, text = "", task = body, name = "")
+            elseif name in ("chat", "newchat", "chat_session")
+                return (kind = :chat_session, text = "", task = "",
+                        name = isempty(body) ? "Chat" : body)
+            elseif name in ("reply", "answer", "done")
+                return (kind = :chat, text = body, task = "", name = "")
+            end
+        end
+    end
     if act !== nothing
         kind = lowercase(getstr(act, "action", ""))
         if kind in ("terminal", "newTerminal", "openTerminal")
-            return (kind = :terminal,
-                    text = String(getstr(act, "reply", "")),
-                    task = String(getstr(act, "task", "")),
-                    name = "")
+            task = String(getstr(act, "task", ""))
+            if !_placeholderActionValue(task)
+                return (kind = :terminal,
+                        text = String(getstr(act, "reply", "")),
+                        task = task,
+                        name = "")
+            end
         end
         if kind in ("chat", "newChat", "newChatSession")
-            return (kind = :chat_session,
-                    text = String(getstr(act, "reply", "")),
-                    task = "",
-                    name = String(getstr(act, "name", "Chat")))
+            name = String(getstr(act, "name", "Chat"))
+            if !_placeholderActionValue(name)
+                return (kind = :chat_session,
+                        text = String(getstr(act, "reply", "")),
+                        task = "",
+                        name = name)
+            end
         end
         body = String(getstr(act, "reply", getstr(act, "message", "")))
         if !isempty(strip(body))
