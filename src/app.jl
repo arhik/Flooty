@@ -59,35 +59,30 @@ id instead of starting empty.
 """
 const HUB_MAX_OUTPUT_TOKENS = 2048
 
-function _hub_default_actor()
+function _core_default_actor()
     auto_hub = lowercase(get(ENV, "FLOOTY_AUTO_HUB", "true")) in ("1", "true", "yes")
     if !(auto_hub && isempty(strip(get(ENV, "FLOOTY_INFERENCE_URL", ""))) &&
            isempty(strip(get(ENV, "FLOOTY_ACTOR_MODEL", ""))))
         return nothing
     end
-    models = try
-        FlootyHub.downloadedModels()
-    catch
-        Dict{String,String}()
-    end
     try
-        FlootyHub.ensure_flootyhub_server!()
-    catch
+        ensureCoreNode!()
+        local_models = [m for m in coreModels()
+                        if String(get(m, "backend", "")) == "local" &&
+                           !isempty(String(get(m, "name", "")))]
+        # A node may expose decision/speech/vision models too. Prefer models
+        # explicitly tagged `chat`; untagged models behave as chat.
+        chat_models = [m for m in local_models
+                       if isempty(String[String(r) for r in get(m, "roles", String[])]) ||
+                          "chat" in String[String(r) for r in get(m, "roles", String[])]]
+        isempty(chat_models) && (chat_models = local_models)
+        isempty(chat_models) && return nothing
+        locals = String[String(get(m, "name", "")) for m in chat_models]
+        return first(sort!(locals))
+    catch err
+        @debug "_core_default_actor failed" exception = err
+        return nothing
     end
-    isempty(models) && return nothing
-    # Model-agnostic: pick the largest installed model, never a name-specific
-    # preference. The user can always override it in the picker.
-    entries = try
-        [e for e in FlootyHub.installed_models() if haskey(models, e.name)]
-    catch
-        FlootyHub.ModelEntry[]
-    end
-    isempty(entries) && return sort(collect(keys(models)))[1]
-    best = entries[1]
-    for e in entries
-        e.size > best.size && (best = e)
-    end
-    return best.name
 end
 
 function agentApp(; cmd::Cmd = DEFAULT_CMD,
@@ -96,14 +91,14 @@ function agentApp(; cmd::Cmd = DEFAULT_CMD,
                   task::AbstractString = "",
                   sessionsDir::Union{Nothing,AbstractString} = nothing,
                   journalPath::Union{Nothing,AbstractString} = nothing)
-    actor = _hub_default_actor()
+    actor = _core_default_actor()
     if actor !== nothing
         base = try
-            FlootyHub.hub_openai_url()
+            ensureCoreNode!()
         catch
-            ""
+            coreBaseUrl()
         end
-        isempty(strip(base)) && (base = "http://127.0.0.1:4434/v1")
+        isempty(strip(base)) && (base = coreBaseUrl())
         try FlootyStreams.set_llamacpp_base_url!(String(base)) catch nothing end
         AGENT_CONFIG[] = AgentModelConfig(
             baseUrl = something(normalizeOllamaUrl(base), DEFAULT_BASE_URL),

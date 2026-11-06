@@ -189,23 +189,26 @@ function chatTurnFor!(sess::ChatSession, wv, text::AbstractString,
     noteUserMessage!(sess, text)
     conv = conversationOf(sess)
     recordTask!(conv, text)
-    try
-        conv.model = AGENT_CONFIG[].actorModel
-    catch
-    end
+    sessionCfg = sessionModelConfig(sess)
+    conv.model = sessionCfg.actorModel
     setSessionStatus!(sess, "thinking")
     @async begin
         try
+            thinkingSeen = Ref(false)
+            onThinking = chunk -> begin
+                thinkingSeen[] = true
+                wv === nothing || pushAgentEventToWindow(wv,
+                    AgentThinkingEvent(sess.id, String(chunk)))
+                nothing
+            end
             fn = CHAT_COMPLETE[]
             if fn === nothing
-                fn = makeCompleteFn(AGENT_CONFIG[], AGENT_CONFIG[].actorModel;
-                    onThinking = chunk -> (wv === nothing ? nothing :
-                        pushAgentEventToWindow(wv,
-                            AgentThinkingEvent(sess.id, String(chunk)))))
+                fn = makeCompleteFn(sessionCfg, sessionCfg.actorModel;
+                    onThinking = onThinking)
             end
             msgs = chatTurnMessages(sess)
             ctxLimit = try
-                contextLengthFor(conv.model)
+                contextLengthFor(sessionCfg.actorModel)
             catch
                 0
             end
@@ -219,15 +222,29 @@ function chatTurnFor!(sess::ChatSession, wv, text::AbstractString,
             wv === nothing || pushAgentEventToWindow(
                 wv, AgentProgressEvent(sess.id, "thinking…"))
             reply = fn(msgs)
+            thinking = strip(extractThinking(reply))
+            if !isempty(thinking) && !thinkingSeen[]
+                thinkingSeen[] = true
+                wv === nothing || pushAgentEventToWindow(wv,
+                    AgentThinkingEvent(sess.id, thinking))
+            end
             parsed = parseChatReply(reply)
-            # A reasoning-only reply (no JSON, nothing after <thinking>) is not
-            # an answer. Retry ONCE with a schema note; the transcript must never
-            # show the raw <thinking> block as the agent's text.
+            # A reasoning-only reply (no JSON, nothing after <thinking>/<think>)
+            # is not an answer. Retry ONCE with the reasoning preserved in the
+            # assistant channel (dropping it made the model re-derive the same
+            # monologue and stop again) plus a schema note. The transcript must
+            # never show the raw thinking block as the agent's text.
             if parsed.kind === :chat && isempty(strip(parsed.text))
                 retry = copy(msgs)
                 prior = strip(stripThinking(reply))
-                isempty(prior) || push!(retry,
-                    OllamaMessage(role = "assistant", content = prior))
+                reasoning = strip(extractThinking(reply))
+                if !isempty(prior)
+                    push!(retry, OllamaMessage(role = "assistant", content = prior,
+                        thinking = isempty(reasoning) ? nothing : reasoning))
+                elseif !isempty(reasoning)
+                    push!(retry, OllamaMessage(role = "assistant",
+                        thinking = reasoning))
+                end
                 push!(retry, OllamaMessage(role = "user",
                     content = "SYSTEM NOTE: your previous reply contained reasoning " *
                               "only. Emit EXACTLY ONE JSON object now: " *
@@ -235,6 +252,12 @@ function chatTurnFor!(sess::ChatSession, wv, text::AbstractString,
                               "a terminal, or {\"reply\":\"…\"} to answer. " *
                               "Never reply with reasoning only."))
                 reply = fn(retry)
+                thinking = strip(extractThinking(reply))
+                if !isempty(thinking) && !thinkingSeen[]
+                    thinkingSeen[] = true
+                    wv === nothing || pushAgentEventToWindow(wv,
+                        AgentThinkingEvent(sess.id, thinking))
+                end
                 parsed = parseChatReply(reply)
             end
             if parsed.kind === :terminal

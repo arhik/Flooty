@@ -196,7 +196,7 @@ function parseFailureAdvice(parseLast::AbstractString,
             break
         end
     end
-    shape = if occursin("<thinking>", parseLast)
+    shape = if !isempty(strip(extractThinking(parseLast)))
         "Output the JSON object only; do not put <thinking> in the content."
     elseif occursin('{', parseLast) && !occursin('}', parseLast)
         "Your JSON was truncated. Shorten the command, split it at a pipe, " *

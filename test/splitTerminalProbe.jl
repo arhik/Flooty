@@ -48,7 +48,7 @@ function snapshot(then)
             }
             var out = {
                 terminals: Object.keys(terminals).length,
-                railTabs: document.querySelectorAll('.terminal-tab').length,
+                railTabs: document.querySelectorAll('.root-icon:not(.tree-map-btn)').length,
                 panes: panels.filter(function (p) { return p.visible; }).length,
                 active: activeTerminalId || null,
                 split: container ? container.classList.contains('split') : null,
@@ -95,7 +95,7 @@ function stepSplitPage()
             say("after split: " * text)
             check("the pane area is split", occursin("\"split\":true", text), first(text, 120))
             check("the child stays IN THE SAME TAB (no new rail tab)",
-                  occursin("\"railTabs\":1", text) && occursin("\"terminals\":2", text),
+                  occursin("\"railTabs\":2", text) && occursin("\"terminals\":2", text),
                   first(text, 160))
             check("two panes are visible", occursin("\"panes\":2", text), text)
             widths = [parse(Int, m.captures[1]) for m in
@@ -137,7 +137,7 @@ function stepSplitJulia()
                     say("after Julia split: " * text2)
                     check("splitTerminalUi splits the pane (same tab)",
                           occursin("\"split\":true", text2) &&
-                          occursin("\"railTabs\":1", text2) &&
+                          occursin("\"railTabs\":2", text2) &&
                           occursin("\"panes\":2", text2), first(text2, 160))
                     say("closing via Julia (the agent's closeSplit path)")
                     FlootyPTYLayer.closeChildTerminalUi(wv)

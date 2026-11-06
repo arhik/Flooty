@@ -668,7 +668,7 @@ function sampleOnce!(state::MonitorState)
             detail = "driver emitted " * string(parseCount) *
                      " consecutive unparseable replies; last: " *
                      first(replace(parseLast, r"\s+" => " "), 160)
-            advice = if occursin("<thinking>", parseLast)
+            advice = if !isempty(strip(extractThinking(parseLast)))
                 "change approach: output the JSON object only — no <thinking>, " *
                 "markdown, or prose in the content."
             elseif occursin('{', parseLast) && !occursin('}', parseLast)

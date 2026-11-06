@@ -365,6 +365,8 @@ julia --project=. test/conversationPersistenceProbe.jl   # store + process resta
 julia --project=. test/providerCallProbe.jl      # native tool-call translation
 julia --project=. test/journalProbe.jl           # event journal + loading a session back
 julia --project=. test/cliProbe.jl               # flooty argument handling (no window)
+julia --project=. test/coreClientProbe.jl        # Flooty as a client of an external FlootyCore
+FLOOTY_CORE_URL=http://127.0.0.1:18081 julia --project=. test/chatCoreProbe.jl  # real Core chat + terminal action
 julia --project=. test/chatLayoutProbe.jl        # chat-only boot, drag-resize, lazy terminal
 julia --project=. test/replModeProbe.jl          # Julia REPL modes: switch them, send per mode
 julia --project=. test/contextProbe.jl           # model window, usage tracking, compaction

@@ -13,7 +13,7 @@
 
 const CONTEXT_LENGTH_CACHE = Dict{String,Int}()
 const CONTEXT_LENGTH_LOCK = ReentrantLock()
-const DEFAULT_CONTEXT_LENGTH = 262_144     # 256K: when nothing reports a window
+const DEFAULT_CONTEXT_LENGTH = 128_000       # 128K: when nothing reports a window
 const CONTEXT_COMPACT_AT = 0.85            # auto-compact at 85% of the window
 const CONTEXT_KEEP_LAST = 24               # messages kept verbatim by compaction
 

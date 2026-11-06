@@ -18,6 +18,7 @@ using FlootyPersistence: JSONBackend
 
 include("conversation.jl")          # per-session transcript (the app owns it)
 include("journal.jl")               # append-only event journal (SQLite now, Arrow later)
+include("coreClient.jl")             # headless node client (models, P2P, sharing)
 include("flootyOllamaClient.jl")
 include("promptDecision.jl")
 include("context.jl")                # model window, usage tracking, compaction
@@ -232,18 +233,34 @@ end
 
 "Models tagged with `role` in FlootyHub that are actually installed."
 function agentModelsForRole(role::AbstractString)
-    entries = try
-        FlootyHub.available_models()
-    catch
-        return String[]
+    out = String[]
+    try
+        entries = FlootyHub.available_models()
+        for entry in entries
+            roles = isempty(entry.roles) ? ["chat"] : entry.roles
+            role in roles || continue
+            push!(out, canonicalAgentModelName(String(entry.name)))
+        end
+    catch err
+        @debug "agentModelsForRole: local FlootyHub unavailable" exception = err
     end
-    models = String[]
-    for entry in entries
-        roles = isempty(entry.roles) ? ["chat"] : entry.roles
-        role in roles || continue
-        push!(models, canonicalAgentModelName(entry.name))
+    # Remote FlootyHub servers can carry their own role-tagged models. They use
+    # the CLI's JSON output so the section headings (`Chat models:`, ...) never
+    # leak into the model list; roles default to chat only when untagged.
+    try
+        for r in lock(SSH_REMOTES_LOCK) do
+            collect(SSH_HUB_REMOTES)
+        end
+            for entry in sshFlootyHubModelEntries(r)
+                roles = isempty(entry.roles) ? ["chat"] : entry.roles
+                role in roles || continue
+                push!(out, "sshhub:" * String(r) * ":" * String(entry.name))
+            end
+        end
+    catch err
+        @debug "agentModelsForRole: remote FlootyHub unavailable" exception = err
     end
-    return sort!(unique!(models))
+    return sort!(unique!(out))
 end
 
 """

@@ -8,6 +8,11 @@ function check(name, ok, detail = "")
     ok || push!(failures, name)
 end
 
+check("extractThinking recognizes Hub <think> tags",
+      extractThinking("<think>plan</think>answer") == "plan", "")
+check("inline <think> is not exposed as chat text",
+      parseChatReply("<think>plan</think>answer").text == "answer", "")
+
 sess = startReplSession(`zsh -i`; waitPrompt = false)
 try
     sleep(1.2); tagIn(sess.control; mode = :agent)

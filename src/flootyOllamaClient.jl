@@ -119,6 +119,15 @@ const SSH_HUB_PROVIDERS = Dict{String,ProviderSpec}()
 const SSH_HUB_REMOTES = Set{String}()
 const SSH_HUB_MODELS_CACHE = Dict{String,Vector{String}}()
 const SSH_HUB_MODELS_AT = Dict{String,Float64}()
+# Roles need more than name records because the monitor picker only wants
+# decision/speech-tagged models from a remote. Keep a parallel cache of the
+# parsed JSON records so `--json` only needs to happen during cache misses.
+struct SSHHubModel
+    name::String
+    roles::Vector{String}
+end
+const SSH_HUB_MODEL_INFO_CACHE = Dict{String,Vector{SSHHubModel}}()
+const SSH_HUB_MODEL_INFO_AT = Dict{String,Float64}()
 const SSH_HUB_MODELS_LOCK = ReentrantLock()
 
 # Background SSH port-forwards for remote FlootyHub providers. They are
@@ -249,9 +258,98 @@ end
 Model names reported by `ssh remote flootyhub list`, each prefixed with
 `sshhub:remote:` so the picker groups it under the right target.
 """
+function _parseSshFlootyHubModelList(raw::AbstractString)::Vector{SSHHubModel}
+    entries = SSHHubModel[]
+    try
+        parsed = JSON.parse(String(raw))
+        models = nothing
+        try models = get(parsed, :models, nothing) catch; end
+        if models === nothing
+            try models = get(parsed, "models", nothing) catch; end
+        end
+        if models isa AbstractArray
+            for item in models
+                name_raw = nothing
+                try name_raw = get(item, :name, get(item, "name", nothing)) catch; end
+                name_raw === nothing && continue
+                name = String(name_raw)
+                isempty(strip(name)) && continue
+
+                roles_raw = nothing
+                try roles_raw = get(item, :roles, get(item, "roles", nothing)) catch; end
+                roles = String[]
+                if roles_raw isa AbstractArray
+                    for value in roles_raw
+                        value isa AbstractString && push!(roles, String(value))
+                    end
+                end
+                push!(entries, SSHHubModel(name, roles))
+            end
+            return entries
+        end
+    catch err
+        @debug "remote FlootyHub JSON parse failed, using text fallback" exception = err
+    end
+
+    for line in split(String(raw), '\n')
+        line = strip(line)
+        isempty(line) && continue
+        lc = lowercase(line)
+        startswith(lc, "name") && continue
+        occursin(r"^(?:chat|decision|speech|vision|embedding)\s+models:\s*$"i, line) && continue
+        occursin("no models installed", lc) && continue
+        m = match(r"^(\S+)", line)
+        m === nothing && continue
+        name = String(m.captures[1])
+        push!(entries, SSHHubModel(name, String[]))
+    end
+    return entries
+end
+
+function sshFlootyHubModelEntries(remote::AbstractString; refresh::Bool = false)
+    r = String(remote)
+    isempty(r) && return SSHHubModel[]
+    cached = lock(SSH_HUB_MODELS_LOCK) do
+        if !refresh && haskey(SSH_HUB_MODEL_INFO_CACHE, r)
+            age = time() - get(SSH_HUB_MODEL_INFO_AT, r, 0.0)
+            age < PROVIDER_GROUPS_TTL ? copy(SSH_HUB_MODEL_INFO_CACHE[r]) : SSHHubModel[]
+        else
+            SSHHubModel[]
+        end
+    end
+    (!isempty(cached) && !refresh) && return cached
+
+    entries = SSHHubModel[]
+    try
+        cmd = `ssh -o ConnectTimeout=5 -o BatchMode=yes $r "export PATH=\$HOME/.julia/bin:\$PATH; flootyhub list --json"`
+        raw = read(cmd, String)
+        entries = _parseSshFlootyHubModelList(raw)
+    catch err
+        @debug "remote FlootyHub JSON listing failed, trying plain text" remote = r exception = err
+        try
+            cmd = `ssh -o ConnectTimeout=5 -o BatchMode=yes $r "export PATH=\$HOME/.julia/bin:\$PATH; flootyhub list"`
+            raw = read(cmd, String)
+            entries = _parseSshFlootyHubModelList(raw)
+        catch err2
+            @debug "remote FlootyHub plain listing failed" remote = r exception = err2
+        end
+    end
+
+    lock(SSH_HUB_MODELS_LOCK) do
+        SSH_HUB_MODEL_INFO_CACHE[r] = entries
+        SSH_HUB_MODEL_INFO_AT[r] = time()
+        names = String[e.name for e in entries]
+        SSH_HUB_MODELS_CACHE[r] = sort!(unique!(["sshhub:" * r * ":" * n for n in names]))
+        SSH_HUB_MODELS_AT[r] = time()
+    end
+    return entries
+end
+
 function listSshFlootyHubModels(remote::AbstractString; refresh::Bool = false)
     r = String(remote)
     isempty(r) && return String[]
+    # Keep a name-only cache with routing prefixes for the flat provider list
+    # and provider-group UI consumers.
     cached = lock(SSH_HUB_MODELS_LOCK) do
         if !refresh && haskey(SSH_HUB_MODELS_CACHE, r)
             age = time() - get(SSH_HUB_MODELS_AT, r, 0.0)
@@ -261,22 +359,8 @@ function listSshFlootyHubModels(remote::AbstractString; refresh::Bool = false)
         end
     end
     (!isempty(cached) && !refresh) && return cached
-    out = String[]
-    try
-        cmd = `ssh -o ConnectTimeout=5 -o BatchMode=yes $r "export PATH=\$HOME/.julia/bin:\$PATH; flootyhub list"`
-        raw = read(cmd, String)
-        for line in split(raw, '\n')
-            line = strip(line)
-            isempty(line) && continue
-            startswith(lowercase(line), "name") && continue
-            m = match(r"^(\S+)", line)
-            m === nothing && continue
-            name = String(m.captures[1])
-            push!(out, "sshhub:" * r * ":" * name)
-        end
-    catch err
-        @debug "listSshFlootyHubModels failed" remote = r exception = err
-    end
+    entries = sshFlootyHubModelEntries(r; refresh = refresh)
+    out = sort!(unique!(["sshhub:" * r * ":" * e.name for e in entries]))
     lock(SSH_HUB_MODELS_LOCK) do
         SSH_HUB_MODELS_CACHE[r] = out
         SSH_HUB_MODELS_AT[r] = time()
@@ -412,23 +496,24 @@ function chatCompletion(baseUrl::AbstractString, model::AbstractString,
                         timeoutS::Real = 120.0,
                         reasoningField::AbstractString = DEFAULT_REASONING_FIELD,
                         maxTokens::Integer = DEFAULT_MAX_OUTPUT_TOKENS, jsonMode::Bool = false)
-    # P2P mode: route through FlootyCompute peers instead of HTTP.
-    if AGENT_CONFIG[].p2p
-        return p2pChatCompletion(model, messages; maxTokens = maxTokens, jsonMode = jsonMode)
+    # Core-routed names: the node's router understands hub:<model> and
+    # p2p:<peer>/<model>. Canonical picker ids carry the llamacpp: prefix and
+    # reach the branch below; accept the bare forms too.
+    if startswith(String(model), "p2p:") || startswith(String(model), "hub:")
+        opts = Dict{String,Any}("temperature" => Float64(temperature),
+                                 "num_predict" => Int(maxTokens))
+        resp = coreChat(String(model), messages; stream=false,
+                        format=jsonMode ? "json" : nothing, options=opts)
+        content = resp.message.content === nothing ? "" : String(resp.message.content)
+        return withReasoning(content, "")
     end
-    # llamacpp models: route through FlootyStreams' Ollama provider (FlootyHub
+    # llamacpp models: route through FlootyStreams' Ollama provider (the node
     # is Ollama-compatible), so streaming/thinking handling is unified.
     if startswith(String(model), "llamacpp:")
-        root = FlootyStreams.LLAMACPP_BASE_URL[]
-        isempty(strip(root)) && error(
-            "no base URL for model '$model' — FlootyHub is not serving " *
-            "(run `flootyhub serve`)")
-        provider = FlootyStreams.OllamaProvider(baseURL = root,
-                                                timeout = Int(round(timeoutS)))
         wire = stripProviderPrefix(model)
         opts = Dict{String,Any}("temperature" => Float64(temperature),
                                  "num_predict" => Int(maxTokens))
-        resp = FlootyStreams.chat(provider, messages, wire, false, nothing, opts)
+        resp = coreChat(wire, messages; stream=false, format=nothing, options=opts)
         return String(something(resp.message.content, ""))
     end
     isempty(strip(baseUrl)) && error(
@@ -488,8 +573,11 @@ block early.
 function withReasoning(content::AbstractString, reasoning::AbstractString)
     isempty(strip(reasoning)) && return String(content)
     occursin("<thinking>", content) && return String(content)
+    occursin("<think>", content) && return String(content)
     occursin("<cot>", content) && return String(content)
+    occursin("<|thought_begin|>", content) && return String(content)
     safe = replace(String(reasoning), "</thinking>" => "")
+    safe = replace(safe, "</think>" => "")
     safe = replace(safe, "</cot>" => "")
     return "<thinking>" * safe * "</thinking>\n" * String(content)
 end
@@ -700,9 +788,9 @@ function extractThinking(text::AbstractString)
     s = stripInvisible(String(text))
     m = match(r"<thinking>(.*?)</thinking>"s, s)
     m === nothing && (m = match(r"<cot>(.*?)</cot>"s, s))
-    m === nothing && (m = match(r"<​think>(.*?)<​/think>"s, s))
+    m === nothing && (m = match(r"<think>(.*?)</think>"s, s))
     m === nothing && (m = match(r"<\|thought_begin\|>(.*?)<\|thought_end\|>"s, s))
-    m === nothing && (m = match(r"<(?:thinking|cot)>\s*(.*?)\s*</?[^>]*>"s, s))
+    m === nothing && (m = match(r"<(?:thinking|think|cot)>\s*(.*?)\s*</?[^>]*>"s, s))
     return m === nothing ? "" : String(m.captures[1])
 end
 |
@@ -758,18 +846,12 @@ function streamCompletion(baseUrl::AbstractString, model::AbstractString,
                           reasoningField::AbstractString = DEFAULT_REASONING_FIELD,
                           maxTokens::Integer = DEFAULT_MAX_OUTPUT_TOKENS, jsonMode::Bool = false,
                           onThinking = nothing)::String
-    # llamacpp models: route through FlootyStreams' Ollama provider.
+    # Core-routed models: the node owns local and P2P dispatch.
     if startswith(String(model), "llamacpp:")
-        root = FlootyStreams.LLAMACPP_BASE_URL[]
-        isempty(strip(root)) && error(
-            "no base URL for model '$model' — FlootyHub is not serving " *
-            "(run `flootyhub serve`)")
-        provider = FlootyStreams.OllamaProvider(baseURL = root,
-                                                timeout = Int(round(timeoutS)))
         wire = stripProviderPrefix(model)
         opts = Dict{String,Any}("temperature" => Float64(temperature),
                                  "num_predict" => Int(maxTokens))
-        ch = FlootyStreams.chat(provider, messages, wire, true, nothing, opts)
+        ch = coreChat(wire, messages; stream=true, format=nothing, options=opts)
         out = IOBuffer()
         for resp in ch
             c = resp.message.content
@@ -777,7 +859,12 @@ function streamCompletion(baseUrl::AbstractString, model::AbstractString,
                 print(out, c)
             end
         end
-        return String(take!(out))
+        full = String(take!(out))
+        thinking = extractThinking(full)
+        if !isempty(strip(thinking)) && onThinking !== nothing
+            onThinking(thinking)
+        end
+        return full
     end
     isempty(strip(baseUrl)) && error(
         "no base URL for model '$model' — the provider is not registered or its " *
@@ -1003,67 +1090,19 @@ actorCompleteFn(cfg::AgentModelConfig = defaultAgentModelConfig();
                 kwargs...) = makeCompleteFn(cfg, cfg.actorModel; jsonMode = true, kwargs...)
 monitorCompleteFn(cfg::AgentModelConfig = defaultAgentModelConfig();
                   kwargs...) = makeCompleteFn(cfg, cfg.monitorModel; jsonMode = true, kwargs...)
-const _P2P_PROVIDER = Ref{Any}(nothing)
-
-"""
-    p2pProvider() -> FlootyComputeProvider
-
-Process-wide singleton P2P provider. Wraps a local OllamaProvider so the node
-can both serve its own models and route to peers. Mirrors PeerCompute, where
-`wrapped` supplies serialization helpers and the self-target fallback.
-"""
-function p2pProvider()
-    cfg = AGENT_CONFIG[]
-    existing = _P2P_PROVIDER[]
-    if existing !== nothing && existing.nodeRunning
-        return existing
-    end
-    # No `wrapped` provider: Flooty is a pure client here. Setting one makes
-    # start_provider list the wrapped models over HTTP, which blocks while a
-    # large model is loading. Add `wrapped` only when this node must serve.
-    p = FlootyAbstract.create_provider_instance(:flootycompute; config = Dict{Symbol,Any}(
-        :p2pPort => cfg.p2pPort,
-        :apiPort => cfg.p2pApiPort,
-        :discovery_topic => cfg.discoveryTopic,
-        :bootstrap_peers => cfg.bootstrapPeers,
-        :enable_mdns => true,
-    ))
-    FlootyStreams.start_provider(p)
-    _P2P_PROVIDER[] = p
-    return p
-end
-function p2pChatCompletion(model::AbstractString, messages::Vector{OllamaMessage};
-                           maxTokens::Integer = DEFAULT_MAX_OUTPUT_TOKENS, jsonMode::Bool = false)
-    p = p2pProvider()
-    format = jsonMode ? "json" : nothing
-    options = Dict{String,Any}("num_predict" => Int(maxTokens))
-    resp = FlootyStreams.chat(p, messages, String(model), false, format, options, nothing)
-    content = resp.message.content === nothing ? "" : String(resp.message.content)
-    return withReasoning(content, "")
-end
-
 # ---- peer models -----------------------------------------------------------
-# The picker above lists what the LOCAL endpoint serves. Peers advertise their
-# own models over FlootyCompute, so when P2P is on we merge those in and keep
-# the two sets separate so the UI can group them.
+# Flooty is a client of FlootyCore. Peers are whatever the node's router
+# advertises as p2p:<peer>/<model>; the picker keeps them in their own group.
 
-"Models advertised by reachable FlootyCompute peers (empty when P2P is off)."
+"Models advertised by the node's reachable P2P peers."
 function peerAgentModels()::Vector{String}
-    cfg = AGENT_CONFIG[]
-    cfg.p2p || return String[]
-    # NEVER start a node here: this runs on the UI thread and start_provider is
-    # a blocking ccall. Only read a provider that is already running.
-    p = _P2P_PROVIDER[]
-    (p === nothing || !p.nodeRunning) && return String[]
-    out = String[]
-    try
-        for peer in FlootyStreams.discover_peers(p)
-            append!(out, peer.models)
-        end
+    models = try
+        corePeerModels()
     catch err
-        @debug "peerAgentModels: discovery failed" exception = err
+        @debug "peerAgentModels: node query failed" exception = err
+        String[]
     end
-    return sort!(unique!(out))
+    return sort!(unique!(["llamacpp:" * m for m in models]))
 end
 
 function _queryProviderModels(spec::ProviderSpec)::Vector{String}
@@ -1116,8 +1155,17 @@ Each name is prefixed with `llamacpp:` so the picker groups it and
 resolveProviderForModel can route it.
 """
 function _listLocalLlamaModels()::Vector{String}
-    # FlootyHub is a direct dependency here; FlootyLlamaModels remains an
-    # optional legacy source loaded into Main.
+    # The node is authoritative: its router prefixes local models with hub:.
+    try
+        models = coreModels()
+        local_models = ["llamacpp:" * String(get(m, "name", "")) for m in models
+                        if String(get(m, "backend", "")) == "local" &&
+                           !isempty(String(get(m, "name", "")))]
+        !isempty(local_models) && return sort!(unique!(local_models))
+    catch err
+        @debug "coreModels local list failed" exception = err
+    end
+    # Fallback for a node that is not reachable: read the Hub directly.
     try
         models = FlootyHub.downloadedModels()
         return ["llamacpp:" * String(k) for k in keys(models)]
@@ -1151,9 +1199,12 @@ function _allProviderGroups()::Vector{ProviderGroup}
     # Local Ollama
     loModels = _listLocalOllamaModels()
     isempty(loModels) || push!(groups, ProviderGroup("Ollama (local)", loModels))
-    # Local Llama.cpp models (via FlootyHub/FlootyLlamaModels)
+    # Local Llama.cpp models (via the node's router)
     lcModels = _listLocalLlamaModels()
     isempty(lcModels) || push!(groups, ProviderGroup("FlootyHub (local)", lcModels))
+    # Models reachable through the node's P2P transport.
+    p2pModels = peerAgentModels()
+    isempty(p2pModels) || push!(groups, ProviderGroup("FlootyCore (P2P)", p2pModels))
     # SSH Ollama remotes
     for r in lock(SSH_REMOTES_LOCK) do; collect(SSH_OLLAMA_REMOTES); end
         m = listSshOllamaModels(r)

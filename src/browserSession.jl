@@ -91,12 +91,14 @@ function browserTurnFor!(sess::BrowserSession, wv, text::AbstractString,
     noteUserMessage!(sess, text)
     conv = conversationFor(sess.id)
     recordTask!(conv, text)
+    sessionCfg = sessionModelConfig(sess)
+    conv.model = sessionCfg.actorModel
     setSessionStatus!(sess, "thinking")
     @async begin
         try
             fn = BROWSER_COMPLETE[]
             if fn === nothing
-                fn = makeCompleteFn(AGENT_CONFIG[], AGENT_CONFIG[].actorModel;
+                fn = makeCompleteFn(sessionCfg, sessionCfg.actorModel;
                     onThinking = chunk -> (wv === nothing ? nothing :
                         pushAgentEventToWindow(wv,
                             AgentThinkingEvent(sess.id, String(chunk)))))
@@ -109,7 +111,7 @@ function browserTurnFor!(sess::BrowserSession, wv, text::AbstractString,
             append!(msgs, conversationContext(conv))
             push!(msgs, OllamaMessage(role = "user", content = "TASK: " * text))
             ctxLimit = try
-                contextLengthFor(AGENT_CONFIG[].actorModel)
+                contextLengthFor(sessionCfg.actorModel)
             catch
                 0
             end

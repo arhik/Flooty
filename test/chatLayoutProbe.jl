@@ -5,8 +5,7 @@
 #     the resize grip is hidden;
 #   * creating a terminal restores the split; the grip then resizes the chat
 #     pane (dragging LEFT widens it) and the width is persisted;
-#   * closing the last terminal returns to chat-only;
-#   * an assist prompt with no terminal spawns one and the agent runs there.
+#   * closing the last terminal returns to chat-only.
 #
 # Run: julia --startup-file=no --project=. test/chatLayoutProbe.jl
 import FlootyPTYLayer
@@ -190,61 +189,9 @@ function stepCloseTerminal()
             check("closing the last terminal returns to chat-only",
                   occursin("\"chatOnly\":true", text) && occursin("\"tabs\":0", text),
                   last(text, 140))
-            stepAssist()
+            finish()
         end
     end, wv, 1.5)
-end
-
-function stepAssist()
-    say("submitting an assist prompt with no terminal")
-    L.Webviews.eval!(wv, """
-        (function () {
-            var ta = document.querySelector('#assistEditor textarea');
-            ta.focus(); ta.value = 'print 1 and stop';
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-            ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter',
-                keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-        })();
-    """)
-    Webviews.set_timeout(function ()
-        snapshot() do
-            text = report[]
-            say("after the first prompt: " * text)
-            check("the prompt spawned a terminal", occursin("\"tabs\":1", text), first(text, 160))
-            check("…and the split layout is back", occursin("\"chatOnly\":false", text))
-            say("waiting for the agent run")
-            Webviews.set_timeout(waitRun, wv, 0.5)
-        end
-    end, wv, 5.0)
-end
-
-function waitRun(attempt = 0)
-    s = lock(() -> isempty(L.OWNERSHIP_SESSIONS) ? nothing :
-                 last(collect(values(L.OWNERSHIP_SESSIONS))), L.OWNERSHIP_SESSIONS_LOCK)
-    if s === nothing
-        if attempt > 200
-            check("the spawned session is adopted", false, "timeout")
-            return finish()
-        end
-        return Webviews.set_timeout(() -> waitRun(attempt + 1), wv, 0.3)
-    end
-    transcript = last(R.lastAgentTranscript(s))
-    busy = try
-        R.agentRunnerBusy(s)
-    catch
-        false
-    end
-    if (isempty(transcript) || !occursin(r"done|Printed|ERROR", transcript)) && attempt < 200
-        if attempt % 20 == 0
-            say("run in progress: busy=" * string(busy) *
-                " transcript=" * repr(first(transcript, 80)))
-        end
-        return Webviews.set_timeout(() -> waitRun(attempt + 1), wv, 0.3)
-    end
-    say("transcript: " * repr(first(transcript, 200)))
-    check("the spawned session ran the instruction",
-          occursin(r"done|Printed 1", transcript), first(transcript, 140))
-    finish()
 end
 
 function boot()
