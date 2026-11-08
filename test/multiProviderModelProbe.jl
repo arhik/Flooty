@@ -25,17 +25,28 @@ end
 check("poolside/ prefix resolves to PoolSide spec",
       resolveProviderForModel("poolside/laguna-s-2.1") !== nothing &&
       resolveProviderForModel("poolside/laguna-s-2.1").kind == :poolside,
-      string(resolveProviderForModel("poolside/laguna-s-2.1")))
+      string(resolveProviderForModel("poolside/laguna-s-2.1").kind))
 
 check("chutes: prefix resolves to Chutes spec",
       resolveProviderForModel("chutes:gpt-4o") !== nothing &&
       resolveProviderForModel("chutes:gpt-4o").kind == :chutes,
-      string(resolveProviderForModel("chutes:gpt-4o")))
+      string(resolveProviderForModel("chutes:gpt-4o").kind))
+
+check("OpenRouter key reads OPENROUTER_API_KEY",
+      withenv("FLOOTY_API_KEY" => "", "OPENROUTER_API_KEY" => "sk-or-env") do
+          Flooty._buildKnownProviders()[:openrouter].apiKey == "sk-or-env"
+      end,
+      "env fallback")
+
+check("openrouter: prefix resolves to OpenRouter spec",
+      resolveProviderForModel("openrouter:stealth/crouton-alpha") !== nothing &&
+      resolveProviderForModel("openrouter:stealth/crouton-alpha").kind == :openrouter,
+      string(resolveProviderForModel("openrouter:stealth/crouton-alpha").kind))
 
 check("ollama: prefix resolves to local Ollama spec",
       resolveProviderForModel("ollama:llama3") !== nothing &&
       resolveProviderForModel("ollama:llama3").kind == :ollama,
-      string(resolveProviderForModel("ollama:llama3")))
+      string(resolveProviderForModel("ollama:llama3").kind))
 
 check("ssh: prefix resolves to registered SSH spec",
       let spec = registerSshOllamaRemote!("user@host")
@@ -56,6 +67,9 @@ check("empty model name resolves to nothing",
 check("stripProviderPrefix strips chutes: prefix",
       stripProviderPrefix("chutes:gpt-4o") == "gpt-4o",
       stripProviderPrefix("chutes:gpt-4o"))
+check("stripProviderPrefix strips openrouter: prefix",
+      stripProviderPrefix("openrouter:stealth/crouton-alpha") == "stealth/crouton-alpha",
+      stripProviderPrefix("openrouter:stealth/crouton-alpha"))
 check("stripProviderPrefix strips ollama: prefix",
       stripProviderPrefix("ollama:llama3") == "llama3",
       stripProviderPrefix("ollama:llama3"))

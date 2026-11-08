@@ -87,7 +87,7 @@ struct ProviderSpec
     defaultModel::String   # provider default if any
     reasoningField::String # request-side reasoning field (e.g. "reasoning_content", "thinking", "")
     contextLength::Int     # default context window for models from this provider
-    kind::Symbol         # :poolside, :chutes, :ollama, :ssh
+    kind::Symbol         # :poolside, :chutes, :openrouter, :ollama, :ssh
     remote::String         # for SSH: "user@host", empty otherwise
 end
 
@@ -388,6 +388,11 @@ function _buildKnownProviders()
     d[:chutes] = ProviderSpec("Chutes",
         "https://llm.chutes.ai/v1", chutesKey, "chutes:", "",
         "reasoning_content", DEFAULT_CONTEXT_LENGTH, :chutes, "")
+    openrouterKey = something(nonempty(get(ENV, "FLOOTY_API_KEY", "")),
+                              nonempty(get(ENV, "OPENROUTER_API_KEY", "")), "")
+    d[:openrouter] = ProviderSpec("OpenRouter",
+        "https://openrouter.ai/api/v1", openrouterKey, "openrouter:", "",
+        "reasoning_content", DEFAULT_CONTEXT_LENGTH, :openrouter, "")
     localUrl = normalizeOllamaUrl(get(ENV, "FLOOTY_OLLAMA_URL", "http://127.0.0.1:11434"))
     localUrl === nothing && (localUrl = "http://127.0.0.1:11434/v1")
     d[:ollama] = ProviderSpec("Ollama (local)",
@@ -1139,6 +1144,15 @@ function _listChutesModels()::Vector{String}
     return ["chutes:" * id for id in models]
 end
 
+function _listOpenRouterModels()::Vector{String}
+    spec = get(KNOWN_PROVIDERS, :openrouter, nothing)
+    spec === nothing && return String[]
+    isempty(spec.apiKey) && return String[]
+    models = _queryProviderModels(spec)
+    isempty(models) && (models = ["stealth/crouton-alpha"])
+    return ["openrouter:" * id for id in models]
+end
+
 function _listSshOllamaModels()::Vector{String}
     out = String[]
     for r in lock(SSH_REMOTES_LOCK) do; collect(SSH_OLLAMA_REMOTES); end
@@ -1196,6 +1210,9 @@ function _allProviderGroups()::Vector{ProviderGroup}
     # Chutes
     chModels = _listChutesModels()
     isempty(chModels) || push!(groups, ProviderGroup("Chutes", chModels))
+    # OpenRouter
+    orModels = _listOpenRouterModels()
+    isempty(orModels) || push!(groups, ProviderGroup("OpenRouter", orModels))
     # Local Ollama
     loModels = _listLocalOllamaModels()
     isempty(loModels) || push!(groups, ProviderGroup("Ollama (local)", loModels))
@@ -1276,6 +1293,7 @@ function resolveProviderForModel(model::AbstractString)::Union{ProviderSpec,Noth
         return nothing
     end
     startswith(m, "chutes:") && return get(KNOWN_PROVIDERS, :chutes, nothing)
+    startswith(m, "openrouter:") && return get(KNOWN_PROVIDERS, :openrouter, nothing)
     startswith(m, "poolside/") && return get(KNOWN_PROVIDERS, :poolside, nothing)
     startswith(m, "ollama:") && return get(KNOWN_PROVIDERS, :ollama, nothing)
     # llamacpp: prefix — local GGUF models managed by FlootyHub.
@@ -1324,8 +1342,8 @@ grouped provider list arrives.
 function canonicalAgentModelName(model::AbstractString)::String
     m = String(model)
     isempty(strip(m)) && return m
-    for prefix in ("llamacpp:", "chutes:", "ollama:", "ssh:", "sshhub:",
-                   "poolside/")
+    for prefix in ("llamacpp:", "chutes:", "openrouter:", "ollama:", "ssh:",
+                   "sshhub:", "poolside/")
         startswith(m, prefix) && return m
     end
     models = try
