@@ -77,6 +77,11 @@ const CHAT_SESSION = Ref{Union{Nothing,ChatSession}}(nothing)
 
 registerSession!(s) = lock(SESSIONS_LOCK) do
     SESSIONS[s.id] = s
+    try
+        ensureDefaultWorkspace!(s)
+    catch err
+        @debug "Flooty workspace auto-register failed" exception = err
+    end
     return s
 end
 
@@ -92,7 +97,7 @@ function registerTerminalSession!(repl; parent_id::Union{Nothing,AbstractString}
     isempty(id) && return nothing
     return lock(SESSIONS_LOCK) do
         held = get(SESSIONS, id, nothing)
-        held !== nothing && return held
+        held !== nothing && (ensureDefaultWorkspace!(held); return held)
         parent = parent_id === nothing || isempty(parent_id) ? nothing : String(parent_id)
         ts = TerminalSession(id = id, parent = parent, repl = repl,
                              kind = Symbol(kind), remote = String(remote))
@@ -103,6 +108,7 @@ function registerTerminalSession!(repl; parent_id::Union{Nothing,AbstractString}
                 id in p.children || push!(p.children, id)
             end
         end
+        ensureDefaultWorkspace!(ts)
         return ts
     end
 end

@@ -229,6 +229,7 @@ main() = runAgentApp()
 """
 CLI entry point (same shape as `flootytui`'s):
 
+    flooty-workspace [options] ["<instruction>"]
     julia -m Flooty [options] ["<instruction>"]
     julia --project=. agentUi.jl [timeoutS] ["<instruction>"]
 
@@ -294,10 +295,11 @@ end
 
 "Print the app's usage block."
 function printAgentUsage()
-    println("Flooty terminal agent")
+    println("Flooty Workspace terminal agent")
     println()
     println("Usage:")
-    println("  Julia app:  julia -m Flooty [options] [\"<instruction>\"]")
+    println("  Julia app:  flooty-workspace [options] [\"<instruction>\"]")
+    println("              julia -m Flooty [options] [\"<instruction>\"]")
     println("  Checkout:   julia --project=. agentUi.jl [timeoutS] [\"<instruction>\"]")
     println("  Function:   using Flooty; Flooty.runAgentApp(task = \"...\")")
     println()
@@ -312,7 +314,7 @@ end
 
 "Report a bad command line on stderr, then the usage block."
 function agentUsage(message::AbstractString)
-    println(stderr, "flooty: ", message)
+    println(stderr, "flooty-workspace: ", message)
     println(stderr)
     printAgentUsage()
     return nothing

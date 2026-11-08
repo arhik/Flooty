@@ -76,6 +76,10 @@ and nothing else (no markdown fence):
 {"action":"closeSplit"}                              close the child pane(s) when done
 {"action":"compact"}                                 fold older turns away (context nearly full)
 {"action":"wait","seconds":<n>}                      let output settle (<=5)
+{"action":"workspaceList"}                          list folder ids + read/write/execute permission
+{"action":"workspaceRead","folder_id":"<uuid>","path":"<relative-or-absolute-inside-folder>"}   read a file (read permission)
+{"action":"workspaceWrite","folder_id":"<uuid>","path":"<relative-or-absolute-inside-folder>","content":"<text>"}   write a file (write permission)
+{"action":"workspaceSearch","query":"<substring>","folder_id":"<uuid-optional>"}   search files (read permission)
 {"action":"feedback","title":"<t>","body":"<b>","kind":"info|warn|interrupt"}
 {"action":"done","summary":"<what was accomplished>"}
 CONTEXT BUDGET: each turn's status line reports the estimated context usage
@@ -664,6 +668,20 @@ struct WaitAction        <: AbstractAction; seconds::Float64; end
 struct InterruptAction   <: AbstractAction; reason::String; end
 struct FeedbackAction    <: AbstractAction; title::String; body::String; kind::String; end
 struct DoneAction        <: AbstractAction; summary::String; end
+struct WorkspaceListAction <: AbstractAction; end
+struct WorkspaceReadAction <: AbstractAction
+    folder_id::String
+    path::String
+end
+struct WorkspaceWriteAction <: AbstractAction
+    folder_id::String
+    path::String
+    content::String
+end
+struct WorkspaceSearchAction <: AbstractAction
+    query::String
+    folder_id::Union{Nothing,String}
+end
 struct UnknownAction     <: AbstractAction; kind::String; end
 
 "Parse the model's action object into a concrete `AbstractAction`."
@@ -686,6 +704,14 @@ function parseAction(obj)::AbstractAction
                                                 getstr(obj, "body"),
                                                 getstr(obj, "kind", "info"))
     kind == "done" && return DoneAction(getstr(obj, "summary"))
+    kind == "workspaceList" && return WorkspaceListAction()
+    kind == "workspaceRead" && return WorkspaceReadAction(
+        getstr(obj, "folder_id"), getstr(obj, "path"))
+    kind == "workspaceWrite" && return WorkspaceWriteAction(
+        getstr(obj, "folder_id"), getstr(obj, "path"), getstr(obj, "content"))
+    kind == "workspaceSearch" && return WorkspaceSearchAction(
+        getstr(obj, "query"),
+        isempty(getstr(obj, "folder_id")) ? nothing : getstr(obj, "folder_id"))
     return UnknownAction(kind)
 end
 
@@ -1083,6 +1109,14 @@ function performAction!(ctx::LoopContext, action::SendAction,
             "doing one step, and keep output short " *
             "(head/tail/sed ranges).")
     end
+    allowed, denyReason = workspaceCommandPermitted(code, sess)
+    if !allowed
+        return sendRefused("workspace denied: " * denyReason,
+            "SYSTEM NOTE: that command references a path outside this session's " *
+            "workspace or a folder without the required permission. Use a path that " *
+            "is inside this session's workspace folders (see the workspace panel), " *
+            "or ask the user to add or grant the folder first.")
+    end
     loopTool(ctx, splitTarget ? "send (" * target * ")" : "send", first(code, 120))
     # Interactive foreground programs (ssh, vim, a nested shell) never return, so
     # `agentWriteAndWait` types them plain and resolves as soon as they START
@@ -1381,6 +1415,10 @@ function performAction!(ctx::LoopContext, action::ParallelAction,
         length(code) <= SEND_MAX_CODE_CHARS ||
             return parallelRefuse!(ctx, "send to " * target * " is $(length(code)) chars " *
                                          "(max $(SEND_MAX_CODE_CHARS))")
+        allowed, denyReason = workspaceCommandPermitted(code, sess)
+        allowed ||
+            return parallelRefuse!(ctx, "workspace denied for " * target *
+                                         ": " * denyReason)
         FlootyPTYLayer.isInteractiveCommand(code) &&
             return parallelRefuse!(ctx, "interactive command in a batch (" * target *
                                          "): " * first(code, 60))
@@ -1428,6 +1466,76 @@ function performAction!(ctx::LoopContext, action::ParallelAction,
     text = String(take!(io))
     push!(ctx.messages, OllamaMessage(role = "user", content = text))
     loopToolResult(ctx, allok, first(replace(text, r"\s+" => " "), 300))
+    return :continue
+end
+
+function performAction!(ctx::LoopContext, action::WorkspaceListAction,
+                        ::TerminalSnapshot)::Symbol
+    key = _workspaceKey(ctx.sess)
+    folders = listWorkspaceFolderInfosPublic(key)
+    loopTool(ctx, "workspaceList", "list workspace folders")
+    loopToolResult(ctx, true, string(length(folders), " folder(s)"))
+    text = if isempty(folders)
+        "no folders yet — the user must add one from the workspace panel"
+    else
+        join([string("- folder_id=", i.id, " name=", i.name,
+                     " permissions=", join(i.permissions, ",")) for i in folders], "\n")
+    end
+    push!(ctx.messages, OllamaMessage(role = "user", content = "ACTION RESULT: ok\n" * text))
+    return :continue
+end
+
+function performAction!(ctx::LoopContext, action::WorkspaceReadAction,
+                        ::TerminalSnapshot)::Symbol
+    key = _workspaceKey(ctx.sess)
+    loopTool(ctx, "workspaceRead", string(action.folder_id, ":", action.path))
+    ok, payload = readWorkspaceFile(key, action.folder_id, action.path)
+    if !ok && occursin("permission", payload)
+        workspaceToolPermissionRequest!(key, action.folder_id, "read",
+                                        string("agent needs read access to ", action.path))
+    end
+    loopToolResult(ctx, ok, ok ? string(length(payload), " bytes") : first(payload, 300))
+    push!(ctx.messages, OllamaMessage(role = "user", content = ok ?
+        "ACTION RESULT: ok\n" * first(payload, 2000) :
+        "ACTION RESULT: ERROR — " * payload))
+    return :continue
+end
+
+function performAction!(ctx::LoopContext, action::WorkspaceWriteAction,
+                        ::TerminalSnapshot)::Symbol
+    key = _workspaceKey(ctx.sess)
+    loopTool(ctx, "workspaceWrite", string(action.folder_id, ":", action.path))
+    ok, payload = writeWorkspaceFile(key, action.folder_id, action.path, action.content)
+    if !ok && occursin("permission", payload)
+        workspaceToolPermissionRequest!(key, action.folder_id, "write",
+                                        string("agent needs write access to ", action.path))
+    end
+    loopToolResult(ctx, ok, ok ? string(first(payload, 200)) : first(payload, 300))
+    push!(ctx.messages, OllamaMessage(role = "user", content = ok ?
+        "ACTION RESULT: ok\nwrote " * payload :
+        "ACTION RESULT: ERROR — " * payload))
+    return :continue
+end
+
+function performAction!(ctx::LoopContext, action::WorkspaceSearchAction,
+                        ::TerminalSnapshot)::Symbol
+    key = _workspaceKey(ctx.sess)
+    loopTool(ctx, "workspaceSearch", action.query)
+    ok, matches = searchWorkspaceFiles(key, action.query, action.folder_id)
+    if !ok
+        workspaceToolPermissionRequest!(key, action.folder_id, "read",
+                                        string("agent needs read access to search for ", action.query))
+    end
+    loopToolResult(ctx, ok, string(length(matches), " match(es)"))
+    text = if !ok
+        "error walking workspace folders"
+    elseif isempty(matches)
+        "no matches"
+    else
+        join([string("- folder_id=", m["folder_id"], " file=", m["file"]) for m in matches], "\n")
+    end
+    push!(ctx.messages, OllamaMessage(role = "user", content = "ACTION RESULT: " *
+        (ok ? "ok" : "ERROR") * "\n" * text))
     return :continue
 end
 

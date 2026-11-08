@@ -17,11 +17,13 @@ FlootyFileTree = "f3f16f31-6b9b-4059-9a3c-102efd888099"
 FlootyHub = "508710d8-3e3a-4883-b65f-5cbb141de57d"
 FlootyPDF = "576ef5c0-6962-46fa-8aa9-095d196e482f"
 FlootyPTYLayer = "c5102509-7890-4b11-b871-c99182d1d95f"
+FlootyPermissions = "bb696aea-d332-4193-b638-9772a39ae69b"
 FlootyPersistence = "fef2fbbe-16ef-428b-8433-3c3d4a0a1e42"
 FlootySessions = "963c42d5-230d-4615-aa6e-0698ef3b700d"
 FlootyStreams = "6174e9c5-3b68-4377-bc3a-426e3f12d78b"
 FlootyTypst = "74e97f80-0c3e-4f71-a3df-a472ecd08ebf"
-FlootyWorkspace = "2fa32d9d-8453-408c-b40e-64fbfe3798ae"
+FlootyWorkspaces = "8eaee756-10f8-4ffe-a99b-aa996c0071ce"
+FlootyLayout = "a102ac74-dd30-45cb-bc4c-465fcdc18c77"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
@@ -35,16 +37,18 @@ FlootyBase = {path = "../FlootyBase"}
 FlootyCompute = {path = "../FlootyCompute"}
 FlootyCore = {path = "../FlootyCore"}
 FlootyEditor = {path = "/Users/arhik/.julia/dev/FlootyEditor"}
-FlootyFileSystem = {path = "/Users/arhik/.julia/dev/FlootyFileSystem"}
+FlootyFileSystem = {path = "/Users/arhik/.julia/dev/FlootyFileSystem-architecture"}
 FlootyFileTree = {path = "/Users/arhik/.julia/dev/FlootyFileTree"}
 FlootyHub = {path = "../FlootyHub"}
+FlootyLayout = {path = "/Users/arhik/.julia/dev/FlootyLayout-architecture"}
 FlootyPDF = {path = "/Users/arhik/.julia/dev/FlootyPDF"}
 FlootyPTYLayer = {path = "/Users/arhik/.julia/dev/FlootyPTYLayer-typst-session"}
+FlootyPermissions = {path = "/Users/arhik/.julia/dev/FlootyPermissions"}
 FlootyPersistence = {path = "../FlootyPersistence"}
-FlootySessions = {path = "../FlootySessions"}
+FlootySessions = {path = "/Users/arhik/.julia/dev/FlootySessions-architecture"}
 FlootyStreams = {path = "../FlootyStreams"}
 FlootyTypst = {path = "/Users/arhik/.julia/dev/FlootyTypst"}
-FlootyWorkspace = {path = "/Users/arhik/.julia/dev/FlootyWorkspace"}
+FlootyWorkspaces = {path = "/Users/arhik/.julia/dev/FlootyWorkspaces-architecture"}
 WebIO = {path = "../WebIO"}
 
 [compat]
@@ -56,4 +60,4 @@ Logging = "1.11.0"
 StructTypes = "1.11.1"
 julia = "1.10"
 
-[apps.flooty]
+[apps.flooty-workspace]

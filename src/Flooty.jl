@@ -38,6 +38,7 @@ include("sessionLayers.jl")        # dynamic layer descriptors for chat/terminal
 include("flootyTrajectoryMonitor.jl")
 include("sessionReattach.jl")
 include("userPreferences.jl")
+include("workspace.jl")
 include("logBridge.jl")             # @warn/@error -> chat transcript
 include("app.jl")                   # the application: entry point + state
 
@@ -111,6 +112,8 @@ function __init__()
     # about models, so the agent side answers for them.
     FlootyPTYLayer.addAgentModelHooks!(agentModelState, selectAgentModel,
                                        selectMonitorModel, selectDecisionModel)
+    FlootyPTYLayer.addWorkspaceHooks!(workspaceUIState, workspaceUIAdd,
+                                      workspaceUIRemove, workspaceUIToggle)
     FlootyPTYLayer.addChatOnlyHandler!(chatSessionTurn!)
     FlootyPTYLayer.addNewChatHandler!(newChatSessionHandler)
     FlootyPTYLayer.addChatCloseHandler!(closeChatSession!)
@@ -199,7 +202,15 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     AgentFeedback, TerminalSnapshot, agentSnapshot, inputTargetFor,
     InputTarget, pushPopup!,
     resolveSplitTarget,
-    startAgentRunner!, stopAgentRunner!, agentRunnerRunning, agentRunnerBusy
+    startAgentRunner!, stopAgentRunner!, agentRunnerRunning, agentRunnerBusy,
+    Workspace, WorkspaceFolder,
+    workspaceFor, ensureWorkspace!, addWorkspaceFolder!, removeWorkspaceFolder!,
+    listWorkspaceFolders, listWorkspaceFolderInfos, folderPermissions,
+    hasFolderPermission, isFolderLocked, toggleWorkspacePermission!,
+    workspaceSummary, readWorkspaceFile, writeWorkspaceFile, listWorkspaceFiles,
+    searchWorkspaceFiles, workspaceUIState, workspaceUIAdd, workspaceUIRemove,
+    workspaceCommandPermitted, ensureDefaultWorkspace!, workspaceLayout,
+    workspaceUIToggle, workspaceUISummary, folderInfo, folderInfoPublic
 
 
 # Eagerly populate the static provider registry so resolveProviderForModel and

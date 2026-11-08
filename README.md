@@ -38,18 +38,18 @@ Pkg.develop(path = "/path/to/Flooty")
 
 ### As an app (Julia ≥ 1.12)
 
-The package declares an app entry point (`[apps.flooty]`), so `Pkg.Apps`
+The package declares an app entry point (`[apps.flooty-workspace]`), so `Pkg.Apps`
 can install a launcher into `~/.julia/bin`:
 
 ```julia
 using Pkg
-Pkg.Apps.develop(path = "/path/to/Flooty")   # writes ~/.julia/bin/flooty
+Pkg.Apps.develop(path = "/path/to/Flooty-workspace-permissions")   # writes ~/.julia/bin/flooty-workspace
 ```
 
 ```sh
-flooty                                            # open the window (all options optional)
-flooty --help                                     # usage
-flooty "run the test suite and summarize the failures"
+flooty-workspace                                            # open the window (all options optional)
+flooty-workspace --help                                     # usage
+flooty-workspace "run the test suite and summarize the failures"
 ```
 
 Every option is optional: with no arguments the app simply launches, and the
