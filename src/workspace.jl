@@ -724,6 +724,142 @@ function searchWorkspaceFiles(key::AbstractString, query::AbstractString, folder
     return (true, out)
 end
 
+function _workspaceTreeEntry(base::AbstractString, path::AbstractString, depth::Int, maxDepth::Int, budget::Base.RefValue{Int})
+    budget[] <= 0 && return nothing
+    rel = relpath(path, base)
+    name = basename(path)
+    entryType = isdir(path) ? "directory" : "file"
+    children = NamedTuple[]
+    dir = isdir(path)
+    if dir && depth < maxDepth
+        try
+            for child in readdir(path)
+                should_skip(child) && continue
+                childEntry = _workspaceTreeEntry(base, joinpath(path, child), depth + 1, maxDepth, budget)
+                childEntry === nothing || push!(children, childEntry)
+                budget[] <= 0 && break
+            end
+        catch err
+            return (name=name, path=abspath(path), relative=relpolicy(rel), type=entryType,
+                    children=children, error=string(err))
+        end
+    end
+    if !dir
+        budget[] -= 1
+    else
+        budget[] -= 1
+    end
+    relpolicy(rel)
+    return (name=name, path=abspath(path), relative=relpolicy(rel), type=entryType, children=children)
+end
+
+relpolicy(x::AbstractString) = replace(String(x), '\\' => '/')
+
+function _workspaceTreeForFolder(folder::WorkspaceFolder; maxDepth::Int=3, maxEntries::Int=400)
+    budget = Ref(maxEntries)
+    root = abspath(folder.path)
+    rel = "."
+    try
+        items = readdir(root)
+        children = NamedTuple[]
+        for child in items
+            should_skip(child) && continue
+            entry = _workspaceTreeEntry(root, joinpath(root, child), 1, maxDepth, budget)
+            entry === nothing || push!(children, entry)
+            budget[] <= 0 && break
+        end
+        return (folder_id=string(folder.id), name=folder.name, path=folder.path, children=children,
+                permissions=[String(p) for p in folder.permissions], attention=folderAttention(folder) !== nothing,
+                truncated=budget[] <= 0)
+    catch err
+        return (folder_id=string(folder.id), name=folder.name, path=folder.path, children=NamedTuple[],
+                permissions=[String(p) for p in folder.permissions], attention=folderAttention(folder) !== nothing,
+                truncated=false, error=string(err))
+    end
+end
+
+function should_skip(name::AbstractString)
+    name in (".git", "node_modules", "__pycache__", ".cache", "target", "build", "dist") || startswith(name, ".")
+end
+
+function _git_run(path::AbstractString, args::Vector{String})
+    try
+        out = read(Cmd(["git", "-C", String(path), args...]), String)
+        return (true, out)
+    catch err
+        return (false, sprint(showerror, err))
+    end
+end
+
+function _git_files(path::AbstractString)
+    cmdArgs = ["status", "--porcelain=v1", "--branch"]
+    ok, raw = _git_run(path, cmdArgs)
+    ok || return (false, [], raw)
+    lines = split(String(raw), '\n')
+    folderCandidates = String[]
+    branch = ""
+    for line in lines
+        startswith(line, "## ") && (branch = strip(line[4:end]))
+    end
+    changed = NamedTuple[]
+    for line in lines
+        length(line) < 4 && continue
+        startswith(line, "## ") && continue
+        status = line[1:2]
+        path = strip(line[4:end])
+        if occursin(" -> ", path)
+            path = strip(last(split(path, " -> ")))
+        end
+        unstaged = status[2] != ' ' && status != "??"
+        staged = status[1] != ' ' && status != "??" && status[1] != "?"
+        untracked = status == "??"
+        push!(changed, (status=String(status), path=path, staged=Bool(staged),
+                        unstaged=Bool(unstaged), untracked=Bool(untracked)))
+    end
+    fileCount = length(changed)
+    stagedCount = sum(c -> c.staged ? 1 : 0, changed; init = 0)
+    unstagedCount = sum(c -> c.unstaged ? 1 : 0, changed; init = 0)
+    untrackedCount = sum(c -> c.untracked ? 1 : 0, changed; init = 0)
+    return (true, (branch=branch, changed=fileCount, staged=stagedCount, unstaged=unstagedCount,
+                   untracked=untrackedCount, files=changed, error=""), "")
+end
+
+function _git_root(path::AbstractString)
+    ok, raw = _git_run(path, ["rev-parse", "--show-toplevel"])
+    ok ? normpath(strip(String(raw))) : nothing
+end
+
+function workspaceChangeStatus(session_id::AbstractString = "")
+    key = isempty(String(session_id)) ? _workspaceKey(ensureRootChatSession!()) : String(session_id)
+    ws = ensureWorkspace!(key)
+    roots = [f.path for f in values(ws.folders)]
+    roots = filter!(isdir, roots)
+    isempty(roots) && return (success=false, error="no granted workspace folders", changes=nothing)
+    for root in roots
+        gr = _git_root(root)
+        gr === nothing && continue
+        ok, payload, err = _git_files(gr)
+        ok && return (success=true, repository=gr, branch=payload.branch, changed=payload.changed,
+                      staged=payload.staged, unstaged=payload.unstaged, untracked=payload.untracked,
+                      files=payload.files)
+    end
+    return (success=true, repository="", branch="not a git repository", changed=0,
+            staged=0, unstaged=0, untracked=0, files=[])
+end
+
+function workspaceFilesUI(session_id::AbstractString = "", folder_id::AbstractString = "")
+    key = isempty(String(session_id)) ? _workspaceKey(ensureRootChatSession!()) : String(session_id)
+    ws = ensureWorkspace!(key)
+    folders = [f for f in [get(ws.folders, id, nothing) for id in ws.folder_order] if f !== nothing]
+    selected = isempty(folder_id) ? nothing : folderById(ws, folder_id)
+    targets = selected !== nothing ? [selected] : folders
+    return (success=true,
+            folders = [(id=string(f.id), name=f.name, path=f.path,
+                        permissions=[String(p) for p in f.permissions],
+                        readonly=f.readonly, attention=folderAttention(f) !== nothing) for f in folders],
+            tree = [_workspaceTreeForFolder(f) for f in targets])
+end
+
 function workspaceUIState(session_id::AbstractString = "")
     sess, key = _sessionForWorkspaceKey(session_id)
     ws = ensureWorkspace!(key)

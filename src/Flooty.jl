@@ -113,7 +113,8 @@ function __init__()
     FlootyPTYLayer.addAgentModelHooks!(agentModelState, selectAgentModel,
                                        selectMonitorModel, selectDecisionModel)
     FlootyPTYLayer.addWorkspaceHooks!(workspaceUIState, workspaceUIAdd,
-                                      workspaceUIRemove, workspaceUIToggle)
+                                      workspaceUIRemove, workspaceUIToggle,
+                                      workspaceFilesUI, workspaceChangeStatus)
     FlootyPTYLayer.addChatOnlyHandler!(chatSessionTurn!)
     FlootyPTYLayer.addNewChatHandler!(newChatSessionHandler)
     FlootyPTYLayer.addChatCloseHandler!(closeChatSession!)
@@ -209,6 +210,7 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     hasFolderPermission, isFolderLocked, toggleWorkspacePermission!,
     workspaceSummary, readWorkspaceFile, writeWorkspaceFile, listWorkspaceFiles,
     searchWorkspaceFiles, workspaceUIState, workspaceUIAdd, workspaceUIRemove,
+    workspaceFilesUI, workspaceChangeStatus,
     workspaceCommandPermitted, ensureDefaultWorkspace!, workspaceLayout,
     workspaceUIToggle, workspaceUISummary, folderInfo, folderInfoPublic
 
