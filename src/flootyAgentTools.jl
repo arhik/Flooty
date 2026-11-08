@@ -227,16 +227,12 @@ function agentSnapshot(sess::ReplSession; tailChars::Int = 0,
     # buffer. Optimising this comes LATER; cutting it first made the model's view
     # diverge from the user's.
     budget = tailChars
-    # FRESHNESS: a snapshot is taken right after one of the agent's own commands,
-    # which is exactly when the page's debounced (120 ms) viewport push has not
-    # fired yet — the model then reads the screen from BEFORE its command and can
-    # repeat an edit whose result is already on screen. Ask for an immediate
-    # report when a window holds this session (bounded wait, cheap); otherwise
-    # use the cached report.
-    screen = FlootyPTYLayer.activeTerminalUiWebview() === nothing ?
-             FlootyPTYLayer.terminalBufferFor(sess) :
-             FlootyPTYLayer.pushTerminalBuffer!(sess; waitS = 0.4)
-    raw = isempty(screen) ? FlootyPTYLayer.tailText(sess.tail) : screen
+    # FRESHNESS: the SERVER-SIDE shadow model is fed the same PTY bytes and is
+    # always current, even with no window attached and even in the middle of a
+    # chunk the page hasn't drained. The page report (the screen the USER sees)
+    # is only a fallback when the shadow isn't adopted (chat-only sessions).
+    raw = FlootyPTYLayer.shadowTextFor(sess)
+    isempty(raw) && (raw = FlootyPTYLayer.tailText(sess.tail))
     # With a caller cap, cut on a LINE boundary so sentinel echo lines are never
     # sliced mid-tag (see _lineAlignedTail); without one, use the text unchanged.
     tailTextStr = budget > 0 ? String(_lineAlignedTail(raw, budget)) : String(raw)
