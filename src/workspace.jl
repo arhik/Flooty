@@ -9,6 +9,8 @@ const WORKSPACES = Dict{String,Workspace}()
 const WORKSPACE_OWNER_ID = Ref{UUID}(uuid4())
 const WORKSPACE_REQUESTS = Dict{UUID,NamedTuple}()
 const WORKSPACE_REQUESTS_LOCK = ReentrantLock()
+const WORKSPACE_DECISIONS = Dict{Tuple{UUID,Symbol},Symbol}()
+const WORKSPACE_DECISIONS_LOCK = ReentrantLock()
 
 function _workspaceKey(x)::String
     x isa AbstractString && return String(x)
@@ -81,12 +83,16 @@ function workspaceCommandPermitted(command::AbstractString, sess)
     if writeish && _copyish(command) && length(paths) >= 2
         for path in paths[1:end-1]
             if !FlootyWorkspaces.can_read(ws, path)
+                _cachedDenial(ws, path, :read) &&
+                    return (false, "read denied at $path (not granted)")
                 _requestWorkspaceAttention!(ws, _workspaceKey(sess), path, "read", "agent needs read access")
                 return (false, "read denied at $path; permission requested")
             end
         end
         dst = paths[end]
         if !FlootyWorkspaces.can_write(ws, dst)
+            _cachedDenial(ws, dst, :write) &&
+                return (false, "write denied at $dst (not granted)")
             _requestWorkspaceAttention!(ws, _workspaceKey(sess), dst, "write", "agent needs write access")
             return (false, "write denied at $dst; permission requested")
         end
@@ -94,6 +100,8 @@ function workspaceCommandPermitted(command::AbstractString, sess)
     elseif writeish
         for path in paths
             if !FlootyWorkspaces.can_write(ws, path)
+                _cachedDenial(ws, path, :write) &&
+                    return (false, "write denied at $path (not granted)")
                 _requestWorkspaceAttention!(ws, _workspaceKey(sess), path, "write", "agent needs write access")
                 return (false, "write denied at $path; permission requested")
             end
@@ -102,6 +110,8 @@ function workspaceCommandPermitted(command::AbstractString, sess)
     else
         for path in paths
             if !FlootyWorkspaces.can_read(ws, path)
+                _cachedDenial(ws, path, :read) &&
+                    return (false, "read denied at $path (not granted)")
                 _requestWorkspaceAttention!(ws, _workspaceKey(sess), path, "read", "agent needs read access")
                 return (false, "read denied at $path; permission requested")
             end
@@ -109,6 +119,44 @@ function workspaceCommandPermitted(command::AbstractString, sess)
         return (true, "")
     end
 end
+
+function _setWorkspaceDecisions!(folder::WorkspaceFolder)
+    lock(WORKSPACE_DECISIONS_LOCK) do
+        for operation in (:read, :write, :execute)
+            WORKSPACE_DECISIONS[(folder.id, operation)] =
+                if LOCKED_PERMISSION in folder.permissions
+                    :deny
+                else
+                    operation in folder.permissions ? :allow : :deny
+                end
+        end
+    end
+    return folder
+end
+
+function _workspaceDecision(folder::WorkspaceFolder, operation::Symbol)
+    lock(WORKSPACE_DECISIONS_LOCK) do
+        get(WORKSPACE_DECISIONS, (folder.id, operation), nothing)
+    end
+end
+
+function _cachedDenialFolder(folder::WorkspaceFolder, operation::AbstractString)
+    op = Symbol(lowercase(String(operation)))
+    _workspaceDecision(folder, op) == :deny && !hasFolderPermission(folder, op)
+end
+
+function _cachedDenial(ws::Workspace, path::AbstractString, operation::Symbol)
+    decision = _workspaceDecision(ws, path, operation)
+    decision === :deny && return true
+    return false
+end
+
+function _workspaceDecision(ws::Workspace, path::AbstractString, operation::Symbol)
+    folder = resolve_workspace_path(ws, String(path))
+    folder === nothing && return :none
+    _workspaceDecision(folder, operation)
+end
+
 
 function _attentionInfo(folderId::UUID)
     lock(WORKSPACE_REQUESTS_LOCK) do
@@ -175,6 +223,7 @@ function _requestFolder!(ws::Workspace, key::AbstractString, path::AbstractStrin
                 permissions = Symbol[])
         end
     end
+    _setWorkspaceDecisions!(folder)
     if !was_attention
         note = string("workspace permission requested: ", operation, " access to '", folder.name, "' (", folder.path, ") — awaiting user review")
         try
@@ -216,6 +265,7 @@ function _setAttentionAndNotify!(ws::Workspace, key::AbstractString, folder::Wor
 end
 
 function workspaceToolPermissionRequest!(key::AbstractString, folderId::Union{AbstractString,UUID,Nothing}, operation::AbstractString, reason::AbstractString)
+    op = Symbol(lowercase(String(operation)))
     ws = ensureWorkspace!(key)
     targets = WorkspaceFolder[]
     if folderId !== nothing
@@ -226,9 +276,10 @@ function workspaceToolPermissionRequest!(key::AbstractString, folderId::Union{Ab
         end
     else
         for folder in listWorkspaceFolders(key)
-            hasFolderPermission(folder, :read) || push!(targets, folder)
+            hasFolderPermission(folder, op) || push!(targets, folder)
         end
     end
+    filter!(folder -> !_cachedDenialFolder(folder, lowercase(String(operation))), targets)
     for folder in targets
         _setAttentionAndNotify!(ws, key, folder, operation, reason)
     end
@@ -243,6 +294,7 @@ end
 
 function _permissionChanged!(key::AbstractString, folder::WorkspaceFolder, note::AbstractString)
     _clearAttention!(folder.id)
+    _setWorkspaceDecisions!(folder)
     try
         pushMonitorNote!(String(key), note; source = :workspace)
     catch err
@@ -506,6 +558,11 @@ function removeWorkspaceFolder!(key::AbstractString, folderId::Union{AbstractStr
     folder === nothing && return false
     _unwatchFolderTree!(folder)
     _clearAttention!(folder.id)
+    lock(WORKSPACE_DECISIONS_LOCK) do
+        for operation in (:read, :write, :execute)
+            pop!(WORKSPACE_DECISIONS, (folder.id, operation), nothing)
+        end
+    end
     removed = FlootyWorkspaces.remove_folder_from_workspace!(ws, fid)
     return removed
 end
