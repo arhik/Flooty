@@ -195,10 +195,28 @@ function chatTurnFor!(sess::ChatSession, wv, text::AbstractString,
     @async begin
         try
             thinkingSeen = Ref(false)
+            thinkPending = Ref("")
+            thinkFlushedAt = Ref(0.0)
+            function flushThinkingBuf()
+                shown = stripProviderMarkup(thinkPending[])
+                isempty(strip(shown)) && (thinkPending[] = ""; return 0)
+                wv === nothing || pushAgentEventToWindow(wv,
+                    AgentThinkingEvent(sess.id, shown))
+                n = length(shown)
+                thinkPending[] = ""
+                thinkFlushedAt[] = time()
+                return n
+            end
+            # Coalesce thinking chunks: one eval! per ~150ms / 400 chars to the
+            # page instead of one per model token, so the JS thread is not
+            # saturated while it is also handling key presses.
             onThinking = chunk -> begin
                 thinkingSeen[] = true
-                wv === nothing || pushAgentEventToWindow(wv,
-                    AgentThinkingEvent(sess.id, String(chunk)))
+                thinkPending[] *= chunk
+                if time() - thinkFlushedAt[] >= 0.15 ||
+                   ncodeunits(thinkPending[]) >= 400
+                    flushThinkingBuf()
+                end
                 nothing
             end
             fn = CHAT_COMPLETE[]
@@ -222,6 +240,7 @@ function chatTurnFor!(sess::ChatSession, wv, text::AbstractString,
             wv === nothing || pushAgentEventToWindow(
                 wv, AgentProgressEvent(sess.id, "thinking…"))
             reply = fn(msgs)
+            flushThinkingBuf()
             thinking = strip(extractThinking(reply))
             if !isempty(thinking) && !thinkingSeen[]
                 thinkingSeen[] = true
