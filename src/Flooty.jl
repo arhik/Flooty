@@ -117,6 +117,7 @@ function __init__()
     registerSessionLayers!()
     FlootyPTYLayer.addBrowserNavigateHandler!(browserNavigateHandler)
     FlootyPTYLayer.addPdfToolResultHandler!(pdfToolResultHandler)
+    FlootyPTYLayer.addPdfInteractionHandler!(pdfInteractionTrace!)
     FlootyPTYLayer.addChatSessionProvider!(function ()
         ensureRootChatSession!()
         return rootChatSession().id

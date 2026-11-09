@@ -689,6 +689,25 @@ The chat INTERFACE reports interaction. `typing` updates the standing watcher's
 draft and activity; `pause` marks it settled; `attach` starts the watcher. The
 loop decides when the draft is model-worthy.
 """
+function pdfInteractionTrace!(session_id::AbstractString, kind::AbstractString,
+                                text::AbstractString)::Bool
+    sess = sessionForId(session_id)
+    sess === nothing && return false
+    eventKind = lowercase(strip(String(kind)))
+    eventText = strip(String(text))
+    isempty(eventText) && (eventText = eventKind)
+    pushMonitorNote!(sess, eventKind * ": " * eventText; source = :pdf)
+    wv = FlootyPTYLayer.activeTerminalUiWebview()
+    if wv !== nothing
+        try
+            pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
+                String(session_id), "pdf: " * eventText; monitor = :pdf))
+        catch
+        end
+    end
+    return true
+end
+
 function chatInteractionTrace!(session_id::AbstractString, kind::AbstractString,
                                text::AbstractString, idle_s::Real)::Bool
     sess = sessionForId(session_id)

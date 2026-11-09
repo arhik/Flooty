@@ -29,7 +29,7 @@ Reply with EXACTLY ONE JSON object and nothing else:
 {"action":"toggleSidebar"}                             toggle the outline/pages sidebar
 {"action":"showPages"}                                show the Pages sidebar tab
 {"action":"showOutline"}                               show the Outline sidebar tab
-{"action":"showNotes"}                                  show the Notes sidebar tab
+{"action":"clearMarks"}                                remove all annotations
 {"action":"bookmark"}                                  toggle bookmark on the current page
 {"action":"saveCopy"}                                  save the annotated PDF as a copy
 {"action":"removeHighlight"}                             remove the currently-selected existing highlight
@@ -40,6 +40,10 @@ Reply with EXACTLY ONE JSON object and nothing else:
 {"action":"reply","text":"<answer>"}             answer the user
 {"action":"done","summary":"<what happened>"}    finish the task
 
+Available highlight colors: yellow, green, blue, pink, red.
+When asked to circle/emphasize/show authors or a passage, use highlight with the requested color.
+When asked to remove all annotations or clear highlights, use clearMarks.
+Unsupported actions have no effect; do not invent commands or describe an action as done unless one of the listed actions was executed.
 When the user asks about selected text, use the selected text as context. When
 Do not return the action as the visible reply; use reply or done for the final answer.
 """
@@ -98,8 +102,8 @@ function parsePdfSend(code::AbstractString)
         return (kind = :pdfcontrol, page = 0, text = "showPages")
     elseif (m = match(r"^showoutline$", normalized)) !== nothing
         return (kind = :pdfcontrol, page = 0, text = "showOutline")
-    elseif (m = match(r"^shownotes?$", normalized)) !== nothing
-        return (kind = :pdfcontrol, page = 0, text = "showNotes")
+    elseif normalized in ["clear annotations", "clear marks", "remove annotations", "remove all annotations", "remove highlights", "remove notes"]
+        return (kind = :pdfcontrol, page = 0, text = "clearMarks")
     elseif (m = match(r"^(?:note)\s+(.+)$", normalized)) !== nothing
         return (kind = :note, page = 0, text = strip(m.captures[1]))
     elseif (m = match(r"^reorder\s+([0-9]+)\s+([0-9]+)$", normalized)) !== nothing
@@ -158,8 +162,8 @@ reply::AbstractString)
         elseif kind == "note"
             note = String(getstr(act, "text", getstr(act, "note", "")))
             return (kind = :note, page = 0, text = note)
-        elseif kind in ("nextpage", "previouspage", "zoomin", "zoomout", "rotate", "copypage", "togglesidebar", "showpages", "showoutline", "shownotes", "bookmark", "savecopy", "removehighlight")
-            controlNames = Dict("nextpage" => "nextPage", "previouspage" => "previousPage", "zoomin" => "zoomIn", "zoomout" => "zoomOut", "rotate" => "rotate", "copypage" => "copyPage", "togglesidebar" => "toggleSidebar", "showpages" => "showPages", "showoutline" => "showOutline", "shownotes" => "showNotes", "bookmark" => "bookmark", "savecopy" => "saveCopy", "removehighlight" => "removeHighlight")
+        elseif kind in ("nextpage", "previouspage", "zoomin", "zoomout", "rotate", "copypage", "togglesidebar", "showpages", "showoutline", "clearmarks", "bookmark", "savecopy", "removehighlight")
+            controlNames = Dict("nextpage" => "nextPage", "previouspage" => "previousPage", "zoomin" => "zoomIn", "zoomout" => "zoomOut", "rotate" => "rotate", "copypage" => "copyPage", "togglesidebar" => "toggleSidebar", "showpages" => "showPages", "showoutline" => "showOutline", "bookmark" => "bookmark", "savecopy" => "saveCopy", "removehighlight" => "removeHighlight", "clearmarks" => "clearMarks")
             return (kind = :pdfcontrol, page = 0, text = controlNames[kind])
         elseif kind == "reorder"
             src = try Int(get(act, :page, get(act, "page", 1))) catch; 1; end
@@ -494,87 +498,7 @@ function browserTurnFor!(sess::PanelSession, wv, text::AbstractString,
                 pushAgentEventToWindow(wv, AgentThinkingEvent(sess.id, strip(thinking)))
             end
             parsed = sess isa PDFSession ? parsePdfReply(reply) : parseBrowserReply(reply)
-            if sess isa PDFSession && parsed.kind === :goto && parsed.page >= 1
-                sess.url = "pdf:page:" * string(parsed.page)
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: goto page " * string(parsed.page)))
-                end
-                shown = "Opening page " * string(parsed.page)
-            elseif sess isa PDFSession && parsed.kind === :done
-                shown = strip(parsed.text)
-            elseif sess isa PDFSession && parsed.kind === :note
-                text = String(parsed.text)
-                sess.url = "pdf:note:" * _uriEncode(text)
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: note"))
-                end
-                shown = "Adding the note"
-            elseif sess isa PDFSession && parsed.kind === :reorder
-                src = parsed.page
-                dst = parsed.position
-                sess.url = "pdf:reorder:" * string(src) * ":" * string(dst)
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: reorder"))
-                end
-                shown = "Reordering page " * string(src) * " to position " * string(dst)
-            elseif sess isa PDFSession && parsed.kind === :pdfcontrol
-                action = String(parsed.text)
-                sess.url = "pdf:control:" * action
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: " * action))
-                end
-                shown = action
-            elseif sess isa PDFSession && parsed.kind === :copy
-                sess.url = "pdf:copySelection:"
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: copied selection"))
-                end
-                shown = "Copied the selected text"
-            elseif sess isa PDFSession && parsed.kind === :matches
-                direction = lowercase(String(parsed.text))
-                sess.url = "pdf:" * direction * "-match:"
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: " * direction * " match"))
-                end
-                shown = lowercase(direction) == "next" ? "Next match" : "Previous match"
-            elseif sess isa PDFSession && parsed.kind === :search
-                query = String(parsed.text)
-                sess.url = "pdf:search:" * _uriEncode(query)
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: search"))
-                end
-                shown = "Searching for '$query'"
-            elseif sess isa PDFSession && parsed.kind === :highlight
-                sess.url = "pdf:highlight:" * string(parsed.text)
-                if wv !== nothing
-                    pushAgentEventToWindow(
-                        wv, AgentBrowserNavigateEvent(sess.id, sess.url))
-                    pushAgentEventToWindow(wv, AgentMonitorThinkingEvent(
-                        sess.id, "pdf: highlight"))
-                end
-                shown = "Highlighting the selected passage"
-            elseif parsed.kind === :navigate && !isempty(strip(parsed.url))
+            if parsed.kind === :navigate && !isempty(strip(parsed.url))
                 url = strip(parsed.url)
                 if !startswith(url, "http://") && !startswith(url, "https://") &&
                    !startswith(url, "about:")
