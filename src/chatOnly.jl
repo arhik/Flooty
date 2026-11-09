@@ -111,7 +111,7 @@ function launchChildChat!(parent_id::AbstractString; name::AbstractString = "Cha
     parent = isempty(parent_id) ? ensureRootChatSession!() : sessionForId(parent_id)
     parent === nothing && (parent = ensureRootChatSession!())
     child = registerSession!(ChatSession(parent = parent.id, layout = :chat))
-    if parent isa ChatSession || parent isa TerminalSession
+    if parent isa AbstractSession
         push!(parent.children, child.id)
     end
     wv = FlootyPTYLayer.activeTerminalUiWebview()
@@ -172,8 +172,8 @@ function launchChatTerminal!(task::AbstractString = "";
 end
 
 "Answer one instruction on the ROOT chat session."
-chatOnlyTurn!(wv, text::AbstractString, tab::AbstractString = "") =
-    chatTurnFor!(ensureRootChatSession!(), wv, text, tab)
+chatOnlyTurn!(wv, text::AbstractString, tab::AbstractString = "", pdf_selection::AbstractString = "") =
+    chatTurnFor!(ensureRootChatSession!(), wv, text, tab, pdf_selection)
 
 """
     chatTurnFor!(sess::ChatSession, wv, text, tab) -> Bool
@@ -182,7 +182,7 @@ Drive ONE chat turn for any ChatSession (root or child): record the task, call
 the model, handle terminal/child-chat tools, and push events tagged with `sess.id`.
 """
 function chatTurnFor!(sess::ChatSession, wv, text::AbstractString,
-                      tab::AbstractString = "")
+                      tab::AbstractString = "", pdf_selection::AbstractString = "")
     startChatMonitor!(sess.id; note_key = sess, wv = wv)
     startTrajectoryMonitor!(sess)
     trajectoryTask!(sess, text)
@@ -225,6 +225,7 @@ function chatTurnFor!(sess::ChatSession, wv, text::AbstractString,
                     onThinking = onThinking)
             end
             msgs = chatTurnMessages(sess)
+            isempty(strip(String(pdf_selection))) || push!(msgs, OllamaMessage(role = "system", content = "SELECTED PDF TEXT:\n" * String(pdf_selection)))
             ctxLimit = try
                 contextLengthFor(sessionCfg.actorModel)
             catch
@@ -324,14 +325,17 @@ The assist binding's 4-argument handler: route to the requested ChatSession
 (child chat tab) or the root.
 """
 function chatSessionTurn!(wv, text::AbstractString, tab::AbstractString = "",
-                          session_id::AbstractString = "")
+                          session_id::AbstractString = "",
+                          pdf_selection::AbstractString = "")
     sid = String(session_id)
     root = ensureRootChatSession!()
-    (isempty(sid) || sid == root.id) && return chatOnlyTurn!(wv, text, tab)
+    (isempty(sid) || sid == root.id) && return chatOnlyTurn!(wv, text, tab, pdf_selection)
     s = sessionForId(sid)
-    s isa ChatSession && return chatTurnFor!(s, wv, text, tab)
-    s isa BrowserSession && return browserTurnFor!(s, wv, text, tab)
-    return chatOnlyTurn!(wv, text, tab)
+    s isa ChatSession && return chatTurnFor!(s, wv, text, tab, pdf_selection)
+    layer = s === nothing ? nothing : FlootyAbstract.session_layer_for_session!(s)
+    layer !== nothing && layer.chat !== nothing &&
+        return FlootyAbstract.session_chat_turn!(s, wv, text, tab, pdf_selection)
+    return chatOnlyTurn!(wv, text, tab, pdf_selection)
 end
 
 "Copy the ROOT chat session's transcript into `sess` (its first terminal)."

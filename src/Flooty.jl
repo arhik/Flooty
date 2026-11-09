@@ -2,6 +2,7 @@ module Flooty
 
 using Dates
 using UUIDs
+import FlootyPDF
 using FlootyPTYLayer
 import FlootySessions
 import FlootyHub
@@ -29,6 +30,8 @@ include("flootyAgentRunner.jl")
 include("sessions.jl")              # the session tree (root chat session)
 include("chatOnly.jl")              # the conversation before any terminal exists
 include("browserSession.jl")        # a live web panel + its driver
+include("pdfSession.jl")            # PDF session sharing the child panel surface
+include("sessionLayers.jl")        # dynamic layer descriptors for chat/terminal/browser/pdf
 include("flootyTrajectoryMonitor.jl")
 include("sessionReattach.jl")
 include("userPreferences.jl")
@@ -109,7 +112,11 @@ function __init__()
     FlootyPTYLayer.addNewChatHandler!(newChatSessionHandler)
     FlootyPTYLayer.addChatCloseHandler!(closeChatSession!)
     FlootyPTYLayer.addNewBrowserHandler!(newBrowserSessionHandler)
+    FlootyPTYLayer.addNewPdfHandler!(newPdfSessionHandler)
+    FlootyPTYLayer.addAssetMount!("/viewer/", FlootyPDF.pdf_assets())
+    registerSessionLayers!()
     FlootyPTYLayer.addBrowserNavigateHandler!(browserNavigateHandler)
+    FlootyPTYLayer.addPdfToolResultHandler!(pdfToolResultHandler)
     FlootyPTYLayer.addChatSessionProvider!(function ()
         ensureRootChatSession!()
         return rootChatSession().id
@@ -141,7 +148,7 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     selectDecisionModel,
     pushMonitorNote!, takeMonitorNotes!, setAgentBrief!, agentBriefFor,
     agentBriefPrompt, chatOnlyTurn!, seedChatThreadInto!,
-    ChatSession, TerminalSession, BrowserSession, ensureRootChatSession!, rootChatSession,
+    ChatSession, TerminalSession, BrowserSession, PDFSession, AbstractPanelSession, AbstractSession, ensureRootChatSession!, rootChatSession,
     sessionForId, registerTerminalSession!, unlinkTerminalSession!,
     publishTerminalStatus!,
     SessionTrace, pushTraceToParent!, takeParentNotes!, steerSession!,
@@ -157,6 +164,8 @@ export activateReplTool!, activeReplSession, deactivateReplTool!,
     parseChatReply, launchChatTerminal!, launchChildChat!, newRootChatSession!,
     newChatSessionHandler, closeChatSession!, launchBrowserSession!, newBrowserSessionHandler,
     browserNavigateHandler, browserTurnFor!, BROWSER_COMPLETE, chatTurnFor!,
+    PDFSession, launchPdfSession!, newPdfSessionHandler, pdfNavigateHandler,
+    pdfTurnFor!, startPdfMonitor!,
     chatSessionTurn!, RUNNER_COMPLETE,
     Conversation, conversationFor, conversationKey, conversationContext,
     conversationTranscript, recordAgentEvent!, conversations, forgetConversation!,

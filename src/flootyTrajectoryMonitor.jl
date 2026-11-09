@@ -338,7 +338,7 @@ function evaluateTrajectory!(m::TrajectoryMonitor, events::Vector{String},
         end
         pushAgentEventToWindow(wv, AgentInsightEvent(
             sid, prefix * insight; monitor = :trajectory))
-        if sess isa ChatSession || sess isa TerminalSession
+        if sess isa AbstractSession
             try
                 pushTraceToParent!(sess,
                     SessionTrace(sess.id, :trajectory, "insight", insight))

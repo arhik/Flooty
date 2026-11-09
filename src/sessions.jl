@@ -9,8 +9,11 @@
 
 using UUIDs
 
+abstract type AbstractSession end
+abstract type AbstractPanelSession <: AbstractSession end
+
 "One user-visible session. `:chat` today; `:terminal`/`:typst` become children."
-Base.@kwdef mutable struct ChatSession
+Base.@kwdef mutable struct ChatSession <: AbstractSession
     id::String = string("chat-", uuid4())
     kind::Symbol = :chat
     parent::Union{Nothing,String} = nothing
@@ -28,7 +31,7 @@ conversationOf(s::ChatSession) = conversationFor(s.id)
 A spawned TERMINAL session: the root chat's child. Two interfaces (the terminal
 pane and its chat rail), so two monitors; its driver is the terminal agent loop.
 """
-Base.@kwdef mutable struct TerminalSession
+Base.@kwdef mutable struct TerminalSession <: AbstractSession
     id::String
     kind::Symbol = :terminal          # :terminal | :ssh
     remote::String = ""               # ssh target (user@host)
@@ -41,12 +44,8 @@ Base.@kwdef mutable struct TerminalSession
     created_at::Float64 = time()
 end
 
-"""
-A BROWSER session: its own web panel (URL bar + iframe) and chat rail. The
-driver navigates/replies; page content is not readable cross-origin (navigation
-is the action surface).
-"""
-Base.@kwdef mutable struct BrowserSession
+abstract type AbstractBrowserSession end
+Base.@kwdef mutable struct BrowserSession <: AbstractPanelSession
     id::String = string("browser-", uuid4())
     parent::Union{Nothing,String} = nothing
     children::Vector{String} = String[]
@@ -85,7 +84,7 @@ function registerTerminalSession!(repl; parent_id::Union{Nothing,AbstractString}
         SESSIONS[id] = ts
         if parent !== nothing && haskey(SESSIONS, parent)
             p = SESSIONS[parent]
-            if p isa ChatSession || p isa TerminalSession || p isa BrowserSession
+            if p isa AbstractSession
                 id in p.children || push!(p.children, id)
             end
         end
@@ -128,14 +127,14 @@ function setParent!(id::AbstractString, newParentId::AbstractString)
         old = sess.parent
         if old !== nothing
             p = get(SESSIONS, old, nothing)
-            if p isa ChatSession || p isa TerminalSession || p isa BrowserSession
+            if p isa AbstractSession
                 filter!(!=(child), p.children)
             end
         end
         sess.parent = isempty(parent) ? nothing : parent
         if !isempty(parent)
             p = get(SESSIONS, parent, nothing)
-            if p isa ChatSession || p isa TerminalSession || p isa BrowserSession
+            if p isa AbstractSession
                 child in p.children || push!(p.children, child)
             end
         end
@@ -151,8 +150,7 @@ function descendantsOf(id::AbstractString)
         cur = pop!(stack)
         node = get(SESSIONS, cur, nothing)
         node === nothing && continue
-        kids = (node isa ChatSession || node isa TerminalSession ||
-                node isa BrowserSession) ? node.children : String[]
+        kids = (node isa AbstractSession) ? node.children : String[]
         for cid in kids
             cid in out || push!(out, cid)
             push!(stack, cid)
@@ -166,7 +164,7 @@ function detachSession!(sess)
     parent = sess.parent
     if parent !== nothing
         p = sessionForId(parent)
-        if p isa ChatSession || p isa TerminalSession || p isa BrowserSession
+        if p isa AbstractSession
             filter!(!=(sess.id), p.children)
         end
     end
@@ -197,12 +195,22 @@ function closeSessionSubtree!(sess, closed::Vector{String})
             @debug "closeSessionSubtree!: terminal kill failed" exception = err
         end
     end
-    stopChatMonitor!(String(sess.id))
-    try
-        stopTrajectoryMonitor!(sess isa TerminalSession && sess.repl !== nothing ? sess.repl : sess)
-    catch
+    layer = sess === nothing || sess isa TerminalSession ? nothing : FlootyAbstract.session_layer_for_session!(sess)
+    if layer !== nothing
+        try
+            layer.close(sess)
+        catch err
+            @debug "closeSessionSubtree!: layer close failed" exception = err
+            detachSession!(sess)
+        end
+    else
+        stopChatMonitor!(String(sess.id))
+        try
+            stopTrajectoryMonitor!(sess isa TerminalSession && sess.repl !== nothing ? sess.repl : sess)
+        catch
+        end
+        detachSession!(sess)
     end
-    detachSession!(sess)
     push!(closed, String(sess.id))
     return nothing
 end
@@ -268,7 +276,7 @@ function unlinkTerminalSession!(repl)
         if ts isa TerminalSession && ts.parent !== nothing &&
            haskey(SESSIONS, ts.parent)
             p = SESSIONS[ts.parent]
-            if p isa ChatSession || p isa TerminalSession || p isa BrowserSession
+            if p isa AbstractSession
                 filter!(!=(id), p.children)
             end
         end
@@ -304,7 +312,7 @@ const PARENT_NOTES_LOCK = ReentrantLock()
 
 "Record a child trace for its parent's driver. Root sessions have no parent."
 function pushTraceToParent!(sess, tr::SessionTrace)
-    parent = sess isa ChatSession || sess isa TerminalSession ? sess.parent : nothing
+    parent = sess isa AbstractSession ? sess.parent : nothing
     parent === nothing && return false
     lock(PARENT_NOTES_LOCK) do
         push!(get!(Vector{String}, PARENT_NOTES, String(parent)),
@@ -368,7 +376,7 @@ end
 "Child session objects (TerminalSession/ChatSession) in creation order."
 function childSessions(sess)
     node = sessionNode(sess)
-    (node isa ChatSession || node isa TerminalSession || node isa BrowserSession) ||
+    (node isa AbstractSession) ||
         return Any[]
     out = Any[]
     for id in copy(node.children)
@@ -406,7 +414,7 @@ end
 
 "Driver-published, concrete session status (mirrored to the parent)."
 function setSessionStatus!(sess, status::AbstractString)
-    (sess isa ChatSession || sess isa TerminalSession || sess isa BrowserSession) ||
+    (sess isa AbstractSession) ||
         return nothing
     sess.status = String(status)
     return nothing
