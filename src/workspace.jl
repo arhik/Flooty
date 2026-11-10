@@ -13,7 +13,12 @@ const WORKSPACE_DECISIONS = Dict{Tuple{UUID,Symbol},Symbol}()
 const WORKSPACE_DECISIONS_LOCK = ReentrantLock()
 
 function _workspaceKey(x)::String
-    x isa AbstractString && return String(x)
+    if x isa AbstractString
+        sess = sessionForId(String(x))
+        sess isa FileTreeSession && sess.parent !== nothing && return String(sess.parent)
+        return String(x)
+    end
+    x isa FileTreeSession && return x.parent === nothing ? x.id : String(x.parent)
     x isa ReplSession && return FlootyPTYLayer.sessionIdFor(x)
     x isa ChatSession && return x.id
     x isa TerminalSession && return x.id
@@ -334,49 +339,96 @@ end
 
 workspaceLayout(sess) = _layoutForSession(sess)
 
-function _watchDirectory(key::AbstractString, folder::WorkspaceFolder, relDir::Union{Nothing,AbstractString})
-    target = relDir === nothing ? folder.path : joinpath(folder.path, relDir)
-    isdir(target) || return nothing
-    folderId = string(folder.id)
+const _FOLDER_STATS_LOCK = ReentrantLock()
+const _FOLDER_STATS_CACHE = Dict{String,NamedTuple}()
+const _FOLDER_STATS_DIRTY = Set{String}()
+const _WATCHERS = Dict{String,Task}()
+const _WATCHERS_LOCK = ReentrantLock()
+
+function _snapshotTree(root::AbstractString; maxDepth::Int = 6)
+    out = Dict{String,Float64}()
+    base = length(splitpath(abspath(root)))
     try
-        FlootyFileSystem.start_file_watcher(target; callback = (rel, action) -> workspace_file_change!(key, folderId, rel, action), interval = 0.01)
-    catch err
-        @debug "FlootyFileSystem watcher failed" path = target exception = err
+        for (dir, dirnames, filenames) in walkdir(root)
+            path = abspath(dir)
+            length(splitpath(path)) - base > maxDepth && (empty!(dirnames); continue)
+            should_skip(basename(dir)) && (empty!(dirnames); continue)
+            for name in dirnames
+                should_skip(name) && continue
+                entry = joinpath(dir, name)
+                out[relpath(entry, root)] = 0.0
+            end
+            for file in filenames
+                should_skip(file) && continue
+                entry = joinpath(dir, file)
+                try
+                    out[relpath(entry, root)] = mtime(entry)
+                catch
+                    out[relpath(entry, root)] = 0.0
+                end
+            end
+        end
+    catch
     end
+    out
+end
+
+"Poll a folder's tree once a second; emit a batched chat-panel notification on change."
+function _watchloop(key::AbstractString, folderId::AbstractString, root::AbstractString)
+    before = _snapshotTree(root)
+    while true
+        sleep(1.0)
+        after = _snapshotTree(root)
+        changed = String[]
+        for (path, stamp) in after
+            prev = get(before, path, nothing)
+            if prev === nothing || stamp != prev
+                push!(changed, path)
+            elseif stamp == 0.0 && prev != 0.0
+                push!(changed, path)
+            end
+        end
+        for path in keys(before)
+            haskey(after, path) || push!(changed, path)
+        end
+        if !isempty(changed)
+            lock(_FOLDER_STATS_LOCK) do
+                push!(_FOLDER_STATS_DIRTY, String(folderId))
+            end
+            for path in changed[1:min(length(changed), 8)]
+                workspace_file_change!(key, folderId, replace(path, "\\" => "/"), "modified")
+            end
+            length(changed) > 8 &&
+                workspace_file_change!(key, folderId, string(length(changed)) * " files", "modified")
+        end
+        before = after
+    end
+end
+
+function _watchDirectory(key::AbstractString, folder::WorkspaceFolder, relDir::Union{Nothing,AbstractString})
     return nothing
 end
 
 function _watchFolderTree!(key::AbstractString, folder::WorkspaceFolder; maxDepth::Int = 1)
-    _watchDirectory(key, folder, nothing)
-    baseDepth = length(splitpath(folder.path))
-    try
-        for (root, dirs, files) in walkdir(folder.path)
-            depth = length(splitpath(root)) - baseDepth
-            depth >= maxDepth && continue
-            for dir in dirs
-                _watchDirectory(key, folder, relpath(joinpath(root, dir), folder.path))
-            end
+    folderId = string(folder.id)
+    lock(_WATCHERS_LOCK) do
+        haskey(_WATCHERS, folderId) && return nothing
+        _WATCHERS[folderId] = Threads.@spawn try
+            _watchloop(key, folderId, abspath(folder.path))
+        catch err
+            @debug "workspace watcher failed" path = folder.path exception = err
         end
-    catch err
-        @debug "FlootyFileSystem tree watch failed" path = folder.path exception = err
     end
     return nothing
 end
 
 function _unwatchFolderTree!(folder::WorkspaceFolder; maxDepth::Int = 1)
-    targets = Set{String}([folder.path])
-    try
-        for (root, dirs, files) in walkdir(folder.path)
-            if length(splitpath(root)) - length(splitpath(folder.path)) >= maxDepth
-                continue
-            end
-            push!(targets, root)
-        end
-    catch
-    end
-    for target in targets
+    folderId = string(folder.id)
+    lock(_WATCHERS_LOCK) do
+        entry = pop!(_WATCHERS, folderId, nothing)
+        entry === nothing && return nothing
         try
-            FlootyFileSystem.stop_file_watcher(target)
+            schedule(entry, InterruptException(); error = true)
         catch
         end
     end
@@ -447,6 +499,22 @@ function folderInfoPublic(folder::WorkspaceFolder)
 end
 
 function _folderStats(folder::WorkspaceFolder; maxEntries::Int = 1000, maxDepth::Int = 4)
+    statsKey = string(folder.id)
+    lock(_FOLDER_STATS_LOCK) do
+        if !(statsKey in _FOLDER_STATS_DIRTY)
+            hit = get(_FOLDER_STATS_CACHE, statsKey, nothing)
+            hit !== nothing && return hit
+        end
+    end
+    computed = _computeFolderStats(folder; maxEntries = maxEntries, maxDepth = maxDepth)
+    lock(_FOLDER_STATS_LOCK) do
+        _FOLDER_STATS_CACHE[statsKey] = computed
+        delete!(_FOLDER_STATS_DIRTY, statsKey)
+    end
+    computed
+end
+
+function _computeFolderStats(folder::WorkspaceFolder; maxEntries::Int = 1000, maxDepth::Int = 4)
     files = 0
     dirs = 0
     truncated = false
@@ -908,3 +976,12 @@ folderPublic(folder::WorkspaceFolder) = folderInfoPublic(folder)
 folderPublic(info::NamedTuple) = info
 
 
+
+"Read a file through workspace permissions; used by the file tree session."
+function workspaceReadUI(session_id::AbstractString, folder_id::AbstractString, path::AbstractString)
+    key = _workspaceKey(session_id)
+    ok, out = readWorkspaceFile(key, String(folder_id), String(path); maxBytes = 2_000_000)
+    return ok ?
+        (success = true, path = String(path), name = basename(String(path)), content = out) :
+        (success = false, error = out)
+end

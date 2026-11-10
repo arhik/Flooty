@@ -34,6 +34,7 @@ include("chatOnly.jl")              # the conversation before any terminal exist
 include("browserSession.jl")        # a live web panel + its driver
 include("pdfSession.jl")            # PDF session sharing the child panel surface
 include("typstSession.jl")          # compound typst editor/PDF session
+include("fileTreeSession.jl")         # standalone file tree session
 include("sessionLayers.jl")        # dynamic layer descriptors for chat/terminal/browser/pdf
 include("flootyTrajectoryMonitor.jl")
 include("sessionReattach.jl")
@@ -115,12 +116,14 @@ function __init__()
     FlootyPTYLayer.addWorkspaceHooks!(workspaceUIState, workspaceUIAdd,
                                       workspaceUIRemove, workspaceUIToggle,
                                       workspaceFilesUI, workspaceChangeStatus)
+    FlootyPTYLayer.addWorkspaceReadHook!(workspaceReadUI)
     FlootyPTYLayer.addChatOnlyHandler!(chatSessionTurn!)
     FlootyPTYLayer.addNewChatHandler!(newChatSessionHandler)
     FlootyPTYLayer.addChatCloseHandler!(closeChatSession!)
     FlootyPTYLayer.addNewBrowserHandler!(newBrowserSessionHandler)
     FlootyPTYLayer.addNewPdfHandler!(newPdfSessionHandler)
     FlootyPTYLayer.addNewTypstHandler!(newTypstSessionHandler)
+    FlootyPTYLayer.addNewFileTreeHandler!(newFileTreeSessionHandler)
     FlootyPTYLayer.addEditorEventHandler!(editorEventHandler)
     FlootyPTYLayer.addEditorListHandler!(editorFileListHandler)
     FlootyPTYLayer.addEditorToggleHandler!(editorToggleDirectoryHandler)

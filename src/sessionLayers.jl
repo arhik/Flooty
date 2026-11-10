@@ -26,6 +26,14 @@ function closeLayerSession!(sess)
         end
         detachSession!(sess)
         return true
+    elseif sess isa FileTreeSession
+        stopChatMonitor!(sess.id)
+        try
+            stopTrajectoryMonitor!(sess)
+        catch
+        end
+        detachSession!(sess)
+        return true
     end
     return false
 end
@@ -100,6 +108,19 @@ function registerSessionLayers!()
         (sess, wv) -> startPdfMonitor!(sess, wv),
         sess -> stopTrajectoryMonitor!(sess),
         nothing)
+    fileTreeChat = FlootyAbstract.SessionChatHooks(
+        (sess, wv, text, tab, selection) -> browserTurnFor!(sess, wv, text, tab, selection),
+        (sess, wv) -> startFileTreeMonitor!(sess, wv),
+        sess -> stopTrajectoryMonitor!(sess),
+        nothing)
+    FlootyAbstract.register_session_layer!(FlootyAbstract.SessionLayerDescriptor(
+        :filetree, "File tree", :document, [:chat, :attach, :command, :close, :monitor, :url, :parent_link, :split],
+        sess -> sess isa FileTreeSession,
+        (; parent_id = "", folder_id = "", name = "File tree") -> launchFileTreeSession!(String(parent_id); folder_id = String(folder_id), name = String(name)),
+        attachLayerSession!, commandLayerSession!, closeLayerSession!,
+        "/filetree/", sess -> "filetree:" * String(sess.id),
+        fileTreeChat))
+
     FlootyAbstract.register_session_layer!(FlootyAbstract.SessionLayerDescriptor(
         :pdf, "PDF", :document, [:chat, :attach, :command, :close, :monitor, :url, :parent_link, :persistence, :split],
         sess -> sess isa PDFSession,

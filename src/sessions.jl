@@ -71,6 +71,18 @@ Base.@kwdef mutable struct TypstSession <: AbstractPanelSession
     created_at::Float64 = time()
 end
 
+abstract type AbstractFileTreeSession end
+Base.@kwdef mutable struct FileTreeSession <: AbstractPanelSession
+    id::String = string("filetree-", uuid4())
+    parent::Union{Nothing,String} = nothing
+    children::Vector{String} = String[]
+    folder_id::String = ""
+    status::String = "idle"
+    interfaces::Vector{Symbol} = Symbol[:filetree, :chat]
+    layout::Symbol = :filetree
+    created_at::Float64 = time()
+end
+
 const SESSIONS = Dict{String,Any}()
 const SESSIONS_LOCK = ReentrantLock()
 const CHAT_SESSION = Ref{Union{Nothing,ChatSession}}(nothing)
