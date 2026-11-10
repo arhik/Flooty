@@ -84,6 +84,11 @@ function launchTypstSession!(parent_id::AbstractString = "";
         pdf_id = project.pdf_id,
         url = "typst:" * project.id))
     editor = FlootyEditor.editor_session(project.editor_id)
+    try
+        addWorkspaceFolder!(sess, project.project_root; name = basename(project.project_root))
+    catch err
+        @debug "Typst workspace grant failed" exception = err
+    end
     registerSession!(editor)
     push!(sess.children, editor.id)
     pdf = FlootyPDF.pdf_session(project.pdf_id)
@@ -121,123 +126,6 @@ function linkAndLaunch(wv, sess, editor; root_id::AbstractString, parent_id::Abs
     end
     FlootyTypst.compile_project!(FlootyTypst.typst_project(sess.id))
     return true
-end
-
-const WORKSPACE_STATE = Dict{String,Any}()
-const WORKSPACE_LOCK = ReentrantLock()
-
-function workspaceJson(payload)
-    JSON.json(payload)
-end
-
-function _workspaceMetadata(tree, workspace)
-    Dict(
-        "id" => string(workspace.id),
-        "name" => workspace.name,
-        "roots" => [Dict(
-            "id" => string(folder.id),
-            "path" => folder.path,
-            "name" => folder.name,
-            "permissions" => [String(permission) for permission in folder.permissions],
-            "readonly" => folder.readonly) for folder in workspace_folders(workspace)]
-    )
-end
-
-function _workspaceEntries(tree)
-    [Dict(
-        "name" => entry.name,
-        "path" => entry.path,
-        "isDir" => entry.is_directory,
-        "depth" => entry.depth,
-        "hidden" => entry.hidden,
-        "expanded" => entry.is_directory && (entry.path in tree.expanded),
-        "modified" => Dates.format(entry.modified, "yyyy-mm-ddTHH:MM:SSZ")
-    ) for entry in FlootyFileTree.list_tree(tree; include_root = false, refresh = true)]
-end
-
-function workspaceStateJson(session_id::AbstractString, root::AbstractString)
-    sess = sessionForId(session_id)
-    projectId = sess isa TypstSession ? sess.id : (sess === nothing || !(sess isa FlootyEditor.EditorSession) ? "" : String(sess.parent))
-    project = isempty(projectId) ? nothing : try FlootyTypst.typst_project(projectId) catch; nothing end
-    base = project === nothing ? String(root) : project.project_root
-    isdir(base) || return workspaceJson(Dict("success" => false, "error" => "folder not found: $base", "entries" => Any[]))
-    key = "tree-" * String(session_id)
-    state = lock(WORKSPACE_LOCK) do
-        found = get(WORKSPACE_STATE, key, nothing)
-        if found === nothing
-            tree = FlootyFileTree.create_tree(base; id = "workspace-tree-" * String(session_id), max_depth = 8)
-            workspace = FlootyWorkspace.create_workspace("Example")
-            folder = FlootyWorkspace.add_folder!(workspace, base; added_by = "workspace")
-            push!(WORKSPACE_STATE, key => (tree = tree, workspace = workspace, root = base))
-            return WORKSPACE_STATE[key]
-        elseif found.root != base
-            try FlootyFileTree.remove_tree!(found.tree) catch; end
-            tree = FlootyFileTree.create_tree(base; id = "workspace-tree-" * String(session_id), max_depth = 8)
-            workspace = FlootyWorkspace.create_workspace("Example")
-            folder = FlootyWorkspace.add_folder!(workspace, base; added_by = "workspace")
-            WORKSPACE_STATE[key] = (tree = tree, workspace = workspace, root = base)
-            return WORKSPACE_STATE[key]
-        end
-        found
-    end
-    Dict(
-        "success" => true,
-        "name" => state.workspace.name,
-        "path" => state.root,
-        "entries" => _workspaceEntries(state.tree),
-        "permissions" => ["read", "write", "execute"]
-    ) |> workspaceJson
-end
-
-function workspaceToggleHandler(session_id::AbstractString, target::AbstractString)
-    key = "tree-" * String(session_id)
-    found = lock(WORKSPACE_LOCK) do
-        state = get(WORKSPACE_STATE, key, nothing)
-        if state !== nothing
-            candidate = String(target)
-            if isfile(candidate)
-
-            elseif isdir(candidate)
-                path = normpath(expanduser(candidate))
-                FlootyFileTree.toggle_directory!(state.tree, path)
-            end
-        end
-        state
-    end
-    found === nothing && return workspaceStateJson(session_id, "")
-    Dict(
-        "success" => true,
-        "path" => found.root,
-        "entries" => _workspaceEntries(found.tree)
-    ) |> workspaceJson
-end
-
-function workspaceCloseHandler(session_id::AbstractString)
-    key = "tree-" * String(session_id)
-    found = lock(WORKSPACE_LOCK) do
-        get(WORKSPACE_STATE, key, nothing)
-    end
-    if found !== nothing
-        try FlootyFileTree.remove_tree!(found.tree) catch; end
-        lock(WORKSPACE_LOCK) do
-            delete!(WORKSPACE_STATE, key)
-        end
-    end
-    workspaceJson(Dict("success" => true, "entries" => Any[]))
-end
-
-function workspaceActionHandler(kind::AbstractString, session_id::AbstractString, payload::AbstractDict)
-    action = lowercase(String(kind))
-    root = String(get(payload, :root, get(payload, "root", "")))
-    if action == "refresh" || action == "state" || action == "open"
-        return workspaceStateJson(String(session_id), root)
-    elseif action == "toggle"
-        target = String(get(payload, :path, get(payload, "path", "")))
-        return workspaceToggleHandler(String(session_id), target)
-    elseif action == "close"
-        return workspaceCloseHandler(String(session_id))
-    end
-    workspaceJson(Dict("success" => false, "error" => "unsupported workspace action: $action", "entries" => Any[]))
 end
 
 function editorEventHandler(kind::AbstractString, session_id::AbstractString, payload)
@@ -312,7 +200,7 @@ function editorTreeFor(session_id, root)
             tree = FlootyFileTree.create_tree(normalized; id = id, max_depth = 6)
             EDITOR_TREE_MAP[String(session_id)] = tree.id
         elseif tree.path != normalized
-            remove_tree!(tree)
+            FlootyFileTree.remove_tree!(tree)
             tree = FlootyFileTree.create_tree(normalized; id = id, max_depth = 6)
             EDITOR_TREE_MAP[String(session_id)] = tree.id
         end
@@ -346,23 +234,23 @@ end
 
 function readEditorDocument(session_id::AbstractString, path::AbstractString)
     requested = normpath(expanduser(String(path)))
-    isfile(requested) || return workspaceJson(Dict("success" => false, "error" => "file not found: $requested"))
+    isfile(requested) || return JSON.json(Dict("success" => false, "error" => "file not found: $requested"))
     editor = sessionForId(session_id)
-    editor isa FlootyEditor.EditorSession || return workspaceJson(Dict("success" => false, "error" => "editor not found"))
+    editor isa FlootyEditor.EditorSession || return JSON.json(Dict("success" => false, "error" => "editor not found"))
     projectId = editor.parent === nothing ? "" : String(editor.parent)
     project = isempty(projectId) ? nothing : try FlootyTypst.typst_project(projectId) catch; nothing end
     if project !== nothing
         root = normpath(expanduser(project.project_root))
-        startswith(requested * Base.Filesystem.path_separator, root * Base.Filesystem.path_separator) || return workspaceJson(Dict("success" => false, "error" => "file is outside the workspace"))
+        startswith(requested * Base.Filesystem.path_separator, root * Base.Filesystem.path_separator) || return JSON.json(Dict("success" => false, "error" => "file is outside the workspace"))
     else
         root = dirname(editor.path)
-        startswith(requested * Base.Filesystem.path_separator, root * Base.Filesystem.path_separator) || return workspaceJson(Dict("success" => false, "error" => "file is outside the workspace"))
+        startswith(requested * Base.Filesystem.path_separator, root * Base.Filesystem.path_separator) || return JSON.json(Dict("success" => false, "error" => "file is outside the workspace"))
     end
     try
         content = read(requested, String)
-        return workspaceJson(Dict("success" => true, "path" => requested, "content" => content, "name" => basename(requested)))
+        return JSON.json(Dict("success" => true, "path" => requested, "content" => content, "name" => basename(requested)))
     catch err
-        return workspaceJson(Dict("success" => false, "error" => "could not read file: $err"))
+        return JSON.json(Dict("success" => false, "error" => "could not read file: $err"))
     end
 end
 
