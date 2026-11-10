@@ -232,7 +232,13 @@ function editorFileListHandler(session_id::AbstractString, root::AbstractString)
     editor isa FlootyEditor.EditorSession || return "[]"
     projectId = editor.parent === nothing ? "" : String(editor.parent)
     project = isempty(projectId) ? nothing : try FlootyTypst.typst_project(projectId) catch _; nothing end
-    base = isempty(root) && project !== nothing ? project.project_root : normpath(expanduser(String(root)))
+    base = if !isempty(root)
+        normpath(expanduser(String(root)))
+    elseif project !== nothing
+        project.project_root
+    else
+        editor.project_root
+    end
     isdir(base) || return "[]"
     tree = editorTreeFor(session_id, base)
     entries = tree === nothing ? Any[] : editorTreeEntries(tree)
