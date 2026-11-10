@@ -2,6 +2,7 @@ using FlootyWorkspaces: Workspace, WorkspaceFolder, find_folder_for_path, is_pat
 using FlootyWorkspaces
 using FlootyWorkspaces: DEFAULT_FOLDER_PERMISSIONS, LOCKED_PERMISSION
 using FlootyLayout
+using FileWatching
 using FlootyFileSystem
 
 const WORKSPACE_STATE_LOCK = ReentrantLock()
@@ -345,97 +346,110 @@ const _FOLDER_STATS_DIRTY = Set{String}()
 const _WATCHERS = Dict{String,Task}()
 const _WATCHERS_LOCK = ReentrantLock()
 
-function _snapshotTree(root::AbstractString; maxDepth::Int = 6)
-    out = Dict{String,Float64}()
-    base = length(splitpath(abspath(root)))
-    try
-        for (dir, dirnames, filenames) in walkdir(root)
-            path = abspath(dir)
-            length(splitpath(path)) - base > maxDepth && (empty!(dirnames); continue)
-            should_skip(basename(dir)) && (empty!(dirnames); continue)
-            for name in dirnames
-                should_skip(name) && continue
-                entry = joinpath(dir, name)
-                out[relpath(entry, root)] = 0.0
+struct _FolderWatchState
+    root::String
+    key::String
+    folderId::String
+    monitors::Set{String}
+    tasks::Vector{Task}
+end
+const _WATCH_STATE_LOCK = ReentrantLock()
+const _WATCHERS = Dict{String,_FolderWatchState}()
+const _WATCH_MONITOR_LIMIT = 256
+
+function _wsSkip(name::AbstractString)
+    return startswith(name, ".") || name in ("node_modules", "target", "dist", "build")
+end
+
+function _startMonitor!(state::_FolderWatchState, dir::AbstractString)
+    key_folder = (state.folderId, dir)
+    lock(_WATCH_STATE_LOCK) do
+        if dir in state.monitors || length(state.monitors) >= _WATCH_MONITOR_LIMIT
+            return false
+        end
+        push!(state.monitors, dir)
+    end
+    Threads.@spawn try
+        fm = FileWatching.FolderMonitor(abspath(dir))
+        while true
+            ev = try
+                wait(fm)
+            catch err
+                # Monitor torn down or folder disappeared; stop this loop.
+                !(err isa InterruptException) && @debug "watch monitor ended" exception=err
+                break
             end
-            for file in filenames
-                should_skip(file) && continue
-                entry = joinpath(dir, file)
-                try
-                    out[relpath(entry, root)] = mtime(entry)
-                catch
-                    out[relpath(entry, root)] = 0.0
+            name = isempty(ev.first) ? "" : String(ev.first)
+            lock(_FOLDER_STATS_LOCK) do
+                push!(_FOLDER_STATS_DIRTY, state.folderId)
+            end
+            rel = isempty(name) ? "" : relpath(joinpath(dir, name), state.root)
+            workspace_file_change!(state.key, state.folderId, replace(rel, "\\" => "/"), "modified")
+            # Newly created subdirectories need their own monitors.
+            full = joinpath(dir, name)
+            if !isempty(name) && isdir(full) && !_wsSkip(basename(full))
+                _startMonitor!(state, full)
+            end
+        end
+    catch err
+        lock(_WATCH_STATE_LOCK) do
+            delete!(state.monitors, dir)
+        end
+        @debug "watch loop ended" exception=err
+    end
+end
+
+"Attach event-driven FolderMonitors to a folder's directories (recursive, bounded)."
+function _watchFolderTree!(key::AbstractString, folder::WorkspaceFolder; maxDepth::Int = 4)
+    root = abspath(folder.path)
+    folderId = string(folder.id)
+    lock(_WATCH_STATE_LOCK) do
+        haskey(_WATCHERS, folderId) && return nothing
+        state = _FolderWatchState(root, String(key), folderId, Set{String}(), Task[])
+        _WATCHERS[folderId] = state
+        push!(state.tasks, _startMonitor!(state, root))
+        # Seed existing subdirectories so edits inside them are seen.
+        try
+            baseDepth = length(splitpath(root))
+            for (dir, dirnames, _) in walkdir(root)
+                depth = length(splitpath(abspath(dir))) - baseDepth
+                depth >= maxDepth && (empty!(dirnames); continue)
+                for name in copy(dirnames)
+                    if _wsSkip(name)
+                        idx = findfirst(==(name), dirnames)
+                        idx === nothing || deleteat!(dirnames, idx)
+                        continue
+                    end
+                    push!(state.tasks, _startMonitor!(state, joinpath(dir, name)))
                 end
             end
-        end
-    catch
-    end
-    out
-end
-
-"Poll a folder's tree once a second; emit a batched chat-panel notification on change."
-function _watchloop(key::AbstractString, folderId::AbstractString, root::AbstractString)
-    before = _snapshotTree(root)
-    while true
-        sleep(1.0)
-        after = _snapshotTree(root)
-        changed = String[]
-        for (path, stamp) in after
-            prev = get(before, path, nothing)
-            if prev === nothing || stamp != prev
-                push!(changed, path)
-            elseif stamp == 0.0 && prev != 0.0
-                push!(changed, path)
-            end
-        end
-        for path in keys(before)
-            haskey(after, path) || push!(changed, path)
-        end
-        if !isempty(changed)
-            lock(_FOLDER_STATS_LOCK) do
-                push!(_FOLDER_STATS_DIRTY, String(folderId))
-            end
-            for path in changed[1:min(length(changed), 8)]
-                workspace_file_change!(key, folderId, replace(path, "\\" => "/"), "modified")
-            end
-            length(changed) > 8 &&
-                workspace_file_change!(key, folderId, string(length(changed)) * " files", "modified")
-        end
-        before = after
-    end
-end
-
-function _watchDirectory(key::AbstractString, folder::WorkspaceFolder, relDir::Union{Nothing,AbstractString})
-    return nothing
-end
-
-function _watchFolderTree!(key::AbstractString, folder::WorkspaceFolder; maxDepth::Int = 1)
-    folderId = string(folder.id)
-    lock(_WATCHERS_LOCK) do
-        haskey(_WATCHERS, folderId) && return nothing
-        _WATCHERS[folderId] = Threads.@spawn try
-            _watchloop(key, folderId, abspath(folder.path))
         catch err
-            @debug "workspace watcher failed" path = folder.path exception = err
+            @debug "watch seed failed" path = folder.path exception = err
         end
     end
     return nothing
 end
 
-function _unwatchFolderTree!(folder::WorkspaceFolder; maxDepth::Int = 1)
+function _unwatchFolderTree!(folder::WorkspaceFolder; maxDepth::Int = 4)
     folderId = string(folder.id)
-    lock(_WATCHERS_LOCK) do
-        entry = pop!(_WATCHERS, folderId, nothing)
-        entry === nothing && return nothing
-        try
-            schedule(entry, InterruptException(); error = true)
-        catch
+    lock(_WATCH_STATE_LOCK) do
+        state = pop!(_WATCHERS, folderId, nothing)
+        state === nothing && return nothing
+        empty!(state.monitors)
+        for task in state.tasks
+            try
+                schedule(task, InterruptException(); error = true)
+            catch
+            end
         end
     end
     return nothing
 end
 
 function workspace_file_change!(key::AbstractString, folderId::AbstractString, path::AbstractString, action::AbstractString)
+    lock(_FOLDER_STATS_LOCK) do
+        push!(_FOLDER_STATS_DIRTY, String(folderId))
+    end
     sid = isempty(key) ? "" : String(key)
     try
         wv = FlootyPTYLayer.activeTerminalUiWebview()
