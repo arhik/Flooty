@@ -31,3 +31,9 @@ function startFileTreeMonitor!(sess::FileTreeSession, wv = nothing)
     startTrajectoryMonitor!(sess)
     return true
 end
+
+function closeFileTreeSession!(session_id::AbstractString)
+    sess = sessionForId(String(session_id))
+    closeLayerSession!(sess)
+    return true
+end
