@@ -3,6 +3,8 @@ module Flooty
 using Dates
 using UUIDs
 import FlootyPDF
+import FlootyEditor
+import FlootyTypst
 using FlootyPTYLayer
 import FlootySessions
 import FlootyHub
@@ -31,6 +33,7 @@ include("sessions.jl")              # the session tree (root chat session)
 include("chatOnly.jl")              # the conversation before any terminal exists
 include("browserSession.jl")        # a live web panel + its driver
 include("pdfSession.jl")            # PDF session sharing the child panel surface
+include("typstSession.jl")          # compound typst editor/PDF session
 include("sessionLayers.jl")        # dynamic layer descriptors for chat/terminal/browser/pdf
 include("flootyTrajectoryMonitor.jl")
 include("sessionReattach.jl")
@@ -113,7 +116,11 @@ function __init__()
     FlootyPTYLayer.addChatCloseHandler!(closeChatSession!)
     FlootyPTYLayer.addNewBrowserHandler!(newBrowserSessionHandler)
     FlootyPTYLayer.addNewPdfHandler!(newPdfSessionHandler)
+    FlootyPTYLayer.addNewTypstHandler!(newTypstSessionHandler)
+    FlootyPTYLayer.addEditorEventHandler!(editorEventHandler)
+    FlootyPTYLayer.addEditorListHandler!(editorFileListHandler)
     FlootyPTYLayer.addAssetMount!("/viewer/", FlootyPDF.pdf_assets())
+    FlootyPTYLayer.addAssetMount!("/editor/", FlootyEditor.editor_assets())
     registerSessionLayers!()
     FlootyPTYLayer.addBrowserNavigateHandler!(browserNavigateHandler)
     FlootyPTYLayer.addPdfToolResultHandler!(pdfToolResultHandler)

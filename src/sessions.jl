@@ -56,6 +56,21 @@ Base.@kwdef mutable struct BrowserSession <: AbstractPanelSession
     created_at::Float64 = time()
 end
 
+Base.@kwdef mutable struct TypstSession <: AbstractPanelSession
+    id::String = string("typst-", uuid4())
+    parent::Union{Nothing,String} = nothing
+    children::Vector{String} = String[]
+    path::String = ""
+    project_root::String = ""
+    editor_id::String = ""
+    pdf_id::String = ""
+    url::String = ""
+    status::String = "editing"
+    interfaces::Vector{Symbol} = Symbol[:typst, :editor, :pdf, :chat]
+    layout::Symbol = :typst
+    created_at::Float64 = time()
+end
+
 const SESSIONS = Dict{String,Any}()
 const SESSIONS_LOCK = ReentrantLock()
 const CHAT_SESSION = Ref{Union{Nothing,ChatSession}}(nothing)
