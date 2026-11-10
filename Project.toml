@@ -12,6 +12,7 @@ FlootyBase = "d7457f72-71a4-4f9c-bcc7-a89b19590879"
 FlootyCompute = "c6a93525-8e48-4f82-b680-707338322753"
 FlootyCore = "3ce61351-72ed-44ec-8032-8eb5e2b0efae"
 FlootyEditor = "0b918cbc-448e-4084-9414-955a0e2ffd8a"
+FlootyFileTree = "f3f16f31-6b9b-4059-9a3c-102efd888099"
 FlootyHub = "508710d8-3e3a-4883-b65f-5cbb141de57d"
 FlootyPDF = "576ef5c0-6962-46fa-8aa9-095d196e482f"
 FlootyPTYLayer = "c5102509-7890-4b11-b871-c99182d1d95f"
@@ -32,6 +33,7 @@ FlootyBase = {path = "../FlootyBase"}
 FlootyCompute = {path = "../FlootyCompute"}
 FlootyCore = {path = "../FlootyCore"}
 FlootyEditor = {path = "/Users/arhik/.julia/dev/FlootyEditor"}
+FlootyFileTree = {path = "/Users/arhik/.julia/dev/FlootyFileTree"}
 FlootyHub = {path = "../FlootyHub"}
 FlootyPDF = {path = "/Users/arhik/.julia/dev/FlootyPDF"}
 FlootyPTYLayer = {path = "/Users/arhik/.julia/dev/FlootyPTYLayer-typst-session"}

@@ -4,6 +4,7 @@ using Base64
 
 import FlootyEditor
 import FlootyTypst
+import FlootyFileTree
 
 const TYPST_COMPILE_TIMERS = Dict{String,Task}()
 const TYPST_COMPILE_LOCK = ReentrantLock()
@@ -177,41 +178,64 @@ function editorEventHandler(kind::AbstractString, session_id::AbstractString, pa
     nothing
 end
 
+const EDITOR_TREE_MAP = Dict{String,String}()
+const EDITOR_TREE_LOCK = ReentrantLock()
+
+function editorTreeFor(session_id, root)
+    normalized = normpath(expanduser(String(root)))
+    isdir(normalized) || return nothing
+    lock(EDITOR_TREE_LOCK) do
+        id = get(EDITOR_TREE_MAP, String(session_id), nothing)
+        tree = nothing
+        if id !== nothing
+            try tree = FlootyFileTree.get_tree(id) catch; end
+        end
+        if tree === nothing
+            id = "tree-" * string(session_id)
+            tree = FlootyFileTree.create_tree(normalized; id = id, max_depth = 6)
+            EDITOR_TREE_MAP[String(session_id)] = tree.id
+        elseif tree.path != normalized
+            remove_tree!(tree)
+            tree = FlootyFileTree.create_tree(normalized; id = id, max_depth = 6)
+            EDITOR_TREE_MAP[String(session_id)] = tree.id
+        end
+        tree
+    end
+end
+
+function editorTreeEntries(tree)
+    [Dict(
+        "name" => entry.name,
+        "path" => entry.path,
+        "isDir" => entry.is_directory,
+        "depth" => entry.depth,
+        "hidden" => entry.hidden,
+        "modified" => Dates.format(entry.modified, "yyyy-mm-ddTHH:MM:SSZ"),
+        "expanded" => entry.is_directory && (entry.path in tree.expanded)
+    ) for entry in FlootyFileTree.list_tree(tree; include_root = false, refresh = true)]
+end
+
+function editorToggleDirectoryHandler(session_id::AbstractString, root::AbstractString, path::AbstractString)
+    tree = editorTreeFor(session_id, root)
+    tree === nothing && return "[]"
+    try
+        FlootyFileTree.toggle_directory!(tree, String(path))
+    catch err
+        @debug "editor expand toggle failed" exception = err
+        return "[]"
+    end
+    JSON.json(editorTreeEntries(tree))
+end
+
 function editorFileListHandler(session_id::AbstractString, root::AbstractString)
     editor = sessionForId(session_id)
     editor isa FlootyEditor.EditorSession || return "[]"
     projectId = editor.parent === nothing ? "" : String(editor.parent)
     project = isempty(projectId) ? nothing : try FlootyTypst.typst_project(projectId) catch _; nothing end
-    base = isempty(root) && project !== nothing ? project.project_root : String(root)
+    base = isempty(root) && project !== nothing ? project.project_root : normpath(expanduser(String(root)))
     isdir(base) || return "[]"
-    entries = Any[]
-    ignored = Set([".git", ".flooty"])
-    function walk(path, depth)
-        depth > 4 && return
-        children = try readdir(path) catch; return; end
-        dirs = String[]; files = String[]
-        for name in sort(children)
-            full = joinpath(path, name)
-            islink(name) && continue
-            try
-                if isdir(full)
-                    name in ignored && continue
-                    push!(dirs, full)
-                elseif isfile(full)
-                    push!(files, full)
-                end
-            catch
-            end
-        end
-        for dir_path in dirs
-            push!(entries, Dict("name" => basename(dir_path), "path" => dir_path, "isDir" => true, "depth" => depth))
-            walk(dir_path, depth + 1)
-        end
-        for file_path in files
-            push!(entries, Dict("name" => basename(file_path), "path" => file_path, "isDir" => false, "depth" => depth))
-        end
-    end
-    walk(base, 0)
+    tree = editorTreeFor(session_id, base)
+    entries = tree === nothing ? Any[] : editorTreeEntries(tree)
     JSON.json(entries)
 end
 
