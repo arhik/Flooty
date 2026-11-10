@@ -36,8 +36,8 @@ function scheduleTypstCompile(project::FlootyTypst.TypstProject; delay_s::Real =
         t = @async begin
             try
                 sleep(Float64(delay_s))
-                save_source!(project)
-                compile_project!(project)
+                FlootyTypst.save_source!(project)
+                FlootyTypst.compile_project!(project)
                 wv = FlootyPTYLayer.activeTerminalUiWebview()
                 if wv !== nothing
                     pdf = FlootyPDF.pdf_session(project.pdf_id)
@@ -69,7 +69,7 @@ function launchTypstSession!(parent_id::AbstractString = "";
                              name::AbstractString = "Typst")
     root = ensureRootChatSession!()
     parent = isempty(parent_id) ? nothing : sessionForId(parent_id)
-    rawPath = strip(String(path))
+    rawPath = normpath(expanduser(strip(String(path))))
     isempty(rawPath) && throw(ArgumentError("typst path cannot be empty"))
     isdir(rawPath) || isfile(rawPath) || throw(ArgumentError("typst path not found: $rawPath"))
     project = FlootyTypst.open_typst_project(rawPath; id = "typst-" * string(uuid4()),
@@ -118,7 +118,7 @@ function linkAndLaunch(wv, sess, editor; root_id::AbstractString, parent_id::Abs
     catch err
         @debug "Typst editor load failed" exception = err
     end
-    compile_project!(FlootyTypst.typst_project(sess.id))
+    FlootyTypst.compile_project!(FlootyTypst.typst_project(sess.id))
     return true
 end
 
@@ -141,8 +141,8 @@ function editorEventHandler(kind::AbstractString, session_id::AbstractString, pa
     elseif k == "save"
         content = String(get(payload, :content, get(payload, "content", editor.content)))
         FlootyEditor.set_content!(editor, content; source = "user")
-        save_source!(project)
-        compile_project!(project)
+        FlootyTypst.save_source!(project)
+        FlootyTypst.compile_project!(project)
         return nothing
     elseif k == "saveas"
         content = String(get(payload, :content, get(payload, "content", editor.content)))
@@ -158,7 +158,7 @@ function editorEventHandler(kind::AbstractString, session_id::AbstractString, pa
         FlootyEditor.mark_saved!(editor; path = proposed)
         project.path = proposed
         project.status = "ready"
-        compile_project!(project)
+        FlootyTypst.compile_project!(project)
         return nothing
     elseif k == "open"
         requested = strip(String(get(payload, :path, get(payload, "path", ""))))
