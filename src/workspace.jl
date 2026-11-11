@@ -23,7 +23,9 @@ function _workspaceKey(x)::String
     x isa ReplSession && return FlootyPTYLayer.sessionIdFor(x)
     x isa ChatSession && return x.id
     x isa TerminalSession && return x.id
+    x isa TypstSession && return x.id
     x isa BrowserSession && return x.id
+    isdefined(x, :id) && return String(getfield(x, :id))
     return string(x)
 end
 
@@ -617,6 +619,7 @@ end
 function addWorkspaceFolder!(key::AbstractString, path::AbstractString; name = "", readonly::Bool = false, recursive::Bool = true)
     expanded = expanduser(String(path))
     isdir(abspath(expanded)) || throw(ArgumentError("Workspace folder does not exist: $expanded"))
+    @info "workspace add folder" key path
     ws = ensureWorkspace!(key)
     folder = FlootyWorkspaces.add_folder_to_workspace!(ws, expanded;
         name = isempty(String(name)) ? basename(abspath(expanded)) : String(name),
@@ -962,6 +965,7 @@ end
 function workspaceUIAdd(session_id::AbstractString, path::AbstractString, name::AbstractString = "")
     key = isempty(String(session_id)) ? _workspaceKey(ensureRootChatSession!()) : String(session_id)
     folder = addWorkspaceFolder!(key, String(path); name = String(name))
+    isdir(abspath(String(path))) || (@info "workspaceUIAdd: not a directory" path)
     return (success = true, folder = folderInfoForUI(folder))
 end
 
